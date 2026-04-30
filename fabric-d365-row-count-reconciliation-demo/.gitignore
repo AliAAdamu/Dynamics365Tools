@@ -1,0 +1,27 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Local config / secrets
+.env
+
+# Generated reports
+report.html
+report.csv
+report_*.html
+report_*.csv
+
+# PyInstaller artefacts
+build/
+dist/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+
+# Staging copies (build.ps1 stages count_rows.py here temporarily)
+fabric-row-counter-ui/count_rows.py
