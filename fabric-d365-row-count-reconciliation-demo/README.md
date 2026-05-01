@@ -91,10 +91,8 @@ The service exposes two operations:
 
 | Operation | Backend | When to use |
  | --------- | ------- | ----------- |
- | `getTableRecordCount`   | Direct SQL `COUNT(*)` against AxDB | **Fastest** — raw physical row count, no X++ 
-overhead. |
- | `getTableRecordCountV2` | X++ `select crossCompany count(RecId) from <Table>` | **Recommended for parity 
-validation** — uses the same code path Fabric Link uses, so the result is guaranteed to match. |
+ | `getTableRecordCount`   | Direct SQL `COUNT(*)` against AxDB | **Fastest** — raw physical row count, no X++ overhead. |
+ | `getTableRecordCountV2` | X++ `select crossCompany count(RecId) from <Table>` | **Recommended for parity validation** — uses the same code path Fabric Link uses, so the result is guaranteed to match. |
  
  > ⚠️ **`getTableRecordCount` (V1) and Fabric Link can disagree.**
  > The direct SQL count includes **orphan records** — for example, rows that
