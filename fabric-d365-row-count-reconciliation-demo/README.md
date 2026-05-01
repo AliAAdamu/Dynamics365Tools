@@ -14,7 +14,7 @@ diverges from the source.
 
 ## 🎬 Demo
 
-https://github.com/AliAAdamu/Dynamics365Tools/blob/main/fabric-d365-row-count-reconciliation-demo/docs/demo.webm
+[https://github.com/AliAAdamu/Dynamics365Tools/blob/main/fabric-d365-row-count-reconciliation-demo/docs/demo.webm](https://github.com/AliAAdamu/Dynamics365Tools/blob/main/fabric-d365-row-count-reconciliation-demo/docs/Dynamics%20365%20Row%20Count%20Demo.webm)
 
 <sub>If the inline player above doesn't render in your viewer, the raw video
 file is at [`docs/demo.webm`](docs/demo.webm).</sub>
