@@ -89,10 +89,20 @@ Per-table verdicts:
 
 The service exposes two operations:
 
-| Operation | Backend | Notes |
-| --------- | ------- | ----- |
-| `getTableRecordCount`   | Direct SQL `COUNT(*)` against AxDB | **Fastest.** Raw physical count. |
-| `getTableRecordCountV2` | X++ `select count(RecId) from <Table>` | Identical to what Fabric Link mirrors — use this for parity validation. |
+| Operation | Backend | When to use |
+ | --------- | ------- | ----------- |
+ | `getTableRecordCount`   | Direct SQL `COUNT(*)` against AxDB | **Fastest** — raw physical row count, no X++ 
+overhead. |
+ | `getTableRecordCountV2` | X++ `select crossCompany count(RecId) from <Table>` | **Recommended for parity 
+validation** — uses the same code path Fabric Link uses, so the result is guaranteed to match. |
+ 
+ > ⚠️ **`getTableRecordCount` (V1) and Fabric Link can disagree.**
+ > The direct SQL count includes **orphan records** — for example, rows that
+ > still exist physically but belong to a **removed legal entity (DataAreaId)**.
+ > Fabric Link skips those rows because it goes through the X++ kernel, which
+ > applies the cross-company / DataAreaId filtering. If you see a small
+ > persistent **Anomaly** with V1, switch to V2 to confirm whether it's real
+ > drift or just orphan rows being counted.
 
 Request body:
 ```json
