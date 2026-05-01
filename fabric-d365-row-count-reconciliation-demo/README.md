@@ -30,7 +30,7 @@ file is at [`docs/demo.webm`](docs/demo.webm).</sub>
 | [`FabricCounter.axpp`](FabricCounter.axpp) | The X++ project that exposes the **`FabricHelperService`** custom service in D365 F&O. **Required** — the Python tools call this service. |
 | [`fabric-row-counter/`](fabric-row-counter/) | The core Python **CLI** (`count_rows.py`) — Fabric ODBC + D365 service call + console / HTML / CSV output. |
 | [`fabric-row-counter-ui/`](fabric-row-counter-ui/) | A **Streamlit web UI** that wraps the CLI in a friendly form with a sortable result grid and download buttons. |
-| [`dist/FabricRowCounter-windows-x64.zip`](#option-a--pre-built-windows-app-no-python-install--easiest) | A pre-built, **self-contained Windows distributable** of the Streamlit UI (PyInstaller bundle). **Not stored in the repo** — published as a [GitHub Release](../releases) asset to keep the repo small. |
+| [`dist/FabricRowCounter-windows-x64.zip`](#option-a--pre-built-windows-app-no-python-install--easiest) | A pre-built, **self-contained Windows distributable** of the Streamlit UI (PyInstaller bundle). **Not stored in the repo** — published as a [GitHub Release](../../../releases) asset to keep the repo small. |
 | [`docs/demo.webm`](docs/demo.webm) | Short screen recording of the Streamlit UI in action. |
 
 ---
@@ -139,7 +139,7 @@ You have **three** options. Pick whichever fits your audience.
 
 ### Option A — Pre-built Windows app (no Python install) ⭐ easiest
 
-1. Go to the [**Releases**](../releases) page of this repository and
+1. Go to the [**Releases**](../../../releases) page of this repository and
    download **`FabricRowCounter-windows-x64.zip`** from the latest release.
 2. Unzip anywhere.
 3. (One-time) Install **ODBC Driver 18 for SQL Server**:
