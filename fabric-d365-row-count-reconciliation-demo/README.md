@@ -14,12 +14,12 @@ diverges from the source.
 
 ## 🎬 Demo
 
-[https://github.com/AliAAdamu/Dynamics365Tools/blob/main/fabric-d365-row-count-reconciliation-demo/docs/Dynamics%20365%20Row%20Count%20Demo.webm](https://github.com/user-attachments/assets/5ef7db81-2ad7-4e0a-ab3e-b925d2c8e0e6)
+[https://github.com/AliAAdamu/Dynamics365Tools/blob/main/fabric-d365-row-count-reconciliation-demo/docs/Fabric-Dynamics365FO-RowCounterSmall.mp4]([https://github.com/user-attachments/assets/65890635-db23-4a5a-83ca-95b5f993e23b](https://github.com/user-attachments/assets/65890635-db23-4a5a-83ca-95b5f993e23b))
 
 <sub>If the inline player above doesn't render in your viewer, the raw video
-file is at [`docs/demo.webm`](docs/demo.webm).</sub>
+file is at [`docs/Fabric-Dynamics365FO-RowCounterSmall.mp4`](docs/demo.webm).</sub>
 
-<video src="docs/demo.webm" controls width="720"></video>
+<video src="docs/Fabric-Dynamics365FO-RowCounterSmall.mp4" controls width="720"></video>
 
 ---
 
