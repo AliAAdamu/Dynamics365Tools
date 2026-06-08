@@ -1,0 +1,23 @@
+# Secrets & generated files
+data/.encryption.key
+data/.flask_secret
+data/environments.json
+data/plans.json
+data/results/
+
+# Uploads
+uploads/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Editor
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,263 @@
+{% extends "base.html" %}
+{% set is_edit = plan is not none and plan.get('id') %}
+{% block title %}{{ 'Edit' if is_edit else 'New' }} Test Plan — D365 DMF Tester{% endblock %}
+
+{% block content %}
+<div class="page-header mb-4">
+  <h2 class="fw-bold">
+    <i class="bi bi-list-check me-2 text-success"></i>
+    {{ 'Edit Test Plan' if is_edit else 'New Test Plan' }}
+  </h2>
+</div>
+
+<div class="row justify-content-center">
+  <div class="col-lg-8">
+    <div class="card border-0 shadow-sm">
+      <div class="card-body p-4">
+        <form method="POST" action="{{ url_for('main.plan_save') }}"
+              enctype="multipart/form-data" id="planForm">
+          {% if is_edit %}
+          <input type="hidden" name="id" value="{{ plan.id }}">
+          {% endif %}
+          {% if is_edit and plan.operation == 'import' %}
+          <input type="hidden" name="existing_file_path" value="{{ plan.file_path | default('') }}">
+          {% endif %}
+
+          <!-- Name & description -->
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Plan Name <span class="text-danger">*</span></label>
+            <input type="text" name="name" class="form-control"
+                   value="{{ plan.name if plan else '' }}"
+                   placeholder="e.g. Import Customers, Export Products"
+                   required>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Description</label>
+            <textarea name="description" class="form-control" rows="2"
+                      placeholder="Optional notes about this test plan">{{ plan.description if plan else '' }}</textarea>
+          </div>
+
+          <!-- Operation type -->
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Operation Type <span class="text-danger">*</span></label>
+            <div class="d-flex gap-3">
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="operation"
+                       id="opImport" value="import"
+                       onchange="switchOperation()"
+                       {{ 'checked' if not plan or plan.get('operation','import') == 'import' }}>
+                <label class="form-check-label" for="opImport">
+                  <i class="bi bi-cloud-upload text-primary me-1"></i>Import
+                </label>
+              </div>
+              <div class="form-check">
+                <input class="form-check-input" type="radio" name="operation"
+                       id="opExport" value="export"
+                       onchange="switchOperation()"
+                       {{ 'checked' if plan and plan.get('operation') == 'export' }}>
+                <label class="form-check-label" for="opExport">
+                  <i class="bi bi-cloud-download text-warning me-1"></i>Export
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <hr>
+
+          <!-- D365 settings -->
+          <h6 class="fw-semibold text-muted mb-3">
+            <i class="bi bi-database me-1"></i>D365 DMF Settings
+          </h6>
+
+          <div class="row g-3 mb-3">
+            <div class="col-md-8">
+              <label class="form-label fw-semibold">
+                Definition Group ID <span class="text-danger">*</span>
+              </label>
+              <div class="input-group">
+                <input type="text" name="definition_group_id" id="defGroupInput"
+                       class="form-control font-monospace"
+                       value="{{ plan.definition_group_id if plan else '' }}"
+                       placeholder="e.g. CustomerV3"
+                       required>
+                <button class="btn btn-outline-secondary" type="button"
+                        onclick="loadGroups()">
+                  <i class="bi bi-search me-1"></i>Browse
+                </button>
+              </div>
+              <div id="groupDropdown" class="list-group position-absolute z-3 shadow"
+                   style="display:none;max-height:200px;overflow-y:auto;width:300px"></div>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label fw-semibold">Legal Entity <span class="text-danger">*</span></label>
+              <input type="text" name="legal_entity" class="form-control font-monospace"
+                     value="{{ plan.legal_entity if plan else '' }}"
+                     placeholder="USMF" required>
+            </div>
+          </div>
+
+          <!-- Import-specific fields -->
+          <div id="importFields">
+            <div class="mb-3">
+              <label class="form-label fw-semibold">Import Package File (.zip)</label>
+              {% if is_edit and plan.get('file_path') %}
+              <div class="alert alert-info py-2 mb-2 small">
+                <i class="bi bi-file-earmark-zip me-1"></i>
+                Current file: <code>{{ plan.file_path | basename }}</code>
+                — upload a new file to replace it.
+              </div>
+              {% endif %}
+              <input type="file" name="import_file" id="importFile"
+                     class="form-control" accept=".zip,.xml,.csv,.txt">
+              <div class="form-text">Upload the DMF data package (.zip) to import each iteration.</div>
+            </div>
+            <div class="row g-3 mb-3">
+              <div class="col-6">
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="execute_immediately"
+                         id="executeCheck"
+                         {{ 'checked' if not plan or plan.get('execute_immediately', True) }}>
+                  <label class="form-check-label" for="executeCheck">Execute Immediately</label>
+                </div>
+              </div>
+              <div class="col-6">
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="overwrite"
+                         id="overwriteCheck"
+                         {{ 'checked' if not plan or plan.get('overwrite', True) }}>
+                  <label class="form-check-label" for="overwriteCheck">Overwrite Existing</label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Export-specific fields -->
+          <div id="exportFields" style="display:none">
+            <div class="row g-3 mb-3">
+              <div class="col-md-8">
+                <label class="form-label fw-semibold">Package Name</label>
+                <input type="text" name="package_name" class="form-control"
+                       value="{{ plan.package_name if plan else '' }}"
+                       placeholder="ExportCustomers">
+                <div class="form-text">Name for the exported package in D365.</div>
+              </div>
+              <div class="col-md-4 d-flex align-items-end pb-1">
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" name="re_execute"
+                         id="reExecCheck"
+                         {{ 'checked' if not plan or plan.get('re_execute', True) }}>
+                  <label class="form-check-label" for="reExecCheck">Re-execute</label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <hr>
+
+          <!-- Polling settings -->
+          <h6 class="fw-semibold text-muted mb-3">
+            <i class="bi bi-hourglass-split me-1"></i>Polling Settings
+          </h6>
+          <div class="row g-3 mb-4">
+            <div class="col-md-6">
+              <label class="form-label fw-semibold">Poll Interval (seconds)</label>
+              <input type="number" name="poll_interval" class="form-control"
+                     value="{{ plan.poll_interval if plan else 5 }}"
+                     min="2" max="60" required>
+              <div class="form-text">How often to check job status.</div>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label fw-semibold">Poll Timeout (seconds)</label>
+              <input type="number" name="poll_timeout" class="form-control"
+                     value="{{ plan.poll_timeout if plan else 600 }}"
+                     min="30" max="3600" required>
+              <div class="form-text">Max wait before marking as Timeout.</div>
+            </div>
+          </div>
+
+          <!-- Browse environment for groups -->
+          <div class="mb-3">
+            <label class="form-label fw-semibold text-muted small">
+              <i class="bi bi-info-circle me-1"></i>
+              Click Browse to load definition groups from a connected environment
+            </label>
+            <select id="envForGroups" class="form-select form-select-sm w-auto">
+              <option value="">— select environment —</option>
+              {% for env in environments %}
+              <option value="{{ env.id }}">{{ env.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="d-flex gap-2">
+            <button type="submit" class="btn btn-success">
+              <i class="bi bi-floppy me-1"></i>Save Plan
+            </button>
+            <a href="{{ url_for('main.plans') }}" class="btn btn-outline-secondary">Cancel</a>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function switchOperation() {
+  const isImport = document.getElementById('opImport').checked;
+  document.getElementById('importFields').style.display = isImport ? '' : 'none';
+  document.getElementById('exportFields').style.display = isImport ? 'none' : '';
+  document.getElementById('importFile').required = isImport && !document.querySelector('input[name=existing_file_path]')?.value;
+}
+
+// Init on load
+switchOperation();
+
+async function loadGroups() {
+  const envId = document.getElementById('envForGroups').value;
+  if (!envId) { alert('Select an environment first.'); return; }
+
+  const btn = event.target;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+
+  try {
+    const resp = await fetch(`/api/environments/${envId}/definition-groups`);
+    const groups = await resp.json();
+    const dd = document.getElementById('groupDropdown');
+
+    if (!groups.length) {
+      dd.innerHTML = '<a class="list-group-item list-group-item-action disabled">No groups found</a>';
+    } else {
+      dd.innerHTML = groups.map(g =>
+        `<a class="list-group-item list-group-item-action" href="#"
+            onclick="selectGroup(event,'${g.DefinitionGroupId}')">
+           <strong>${g.DefinitionGroupId}</strong>
+           <small class="text-muted ms-2">${g.Description || ''}</small>
+         </a>`
+      ).join('');
+    }
+    dd.style.display = 'block';
+  } catch(e) {
+    alert('Failed to load groups: ' + e);
+  }
+
+  btn.disabled = false;
+  btn.innerHTML = '<i class="bi bi-search me-1"></i>Browse';
+}
+
+function selectGroup(e, groupId) {
+  e.preventDefault();
+  document.getElementById('defGroupInput').value = groupId;
+  document.getElementById('groupDropdown').style.display = 'none';
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#groupDropdown') && !e.target.closest('button[onclick="loadGroups()"]')) {
+    document.getElementById('groupDropdown').style.display = 'none';
+  }
+});
+</script>
+{% endblock %}

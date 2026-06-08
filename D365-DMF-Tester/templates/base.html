@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en" data-bs-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}D365 DMF Tester{% endblock %}</title>
+  <!-- Bootstrap 5.3 -->
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        crossorigin="anonymous">
+  <!-- Bootstrap Icons -->
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css"
+        crossorigin="anonymous">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+
+<!-- ── Sidebar ──────────────────────────────────────────────────────────── -->
+<div class="d-flex" id="wrapper">
+  <nav id="sidebar" class="sidebar d-flex flex-column flex-shrink-0 p-3 text-white">
+    <a href="{{ url_for('main.index') }}" class="brand d-flex align-items-center mb-3 mb-md-0 me-md-auto text-white text-decoration-none">
+      <i class="bi bi-database-gear fs-4 me-2"></i>
+      <span class="fs-6 fw-bold">D365 DMF Tester</span>
+    </a>
+    <hr>
+    <ul class="nav nav-pills flex-column mb-auto">
+      <li class="nav-item">
+        <a href="{{ url_for('main.index') }}"
+           class="nav-link text-white {% if request.endpoint == 'main.index' %}active{% endif %}">
+          <i class="bi bi-speedometer2 me-2"></i>Dashboard
+        </a>
+      </li>
+      <li>
+        <a href="{{ url_for('main.environments') }}"
+           class="nav-link text-white {% if 'environment' in request.endpoint %}active{% endif %}">
+          <i class="bi bi-globe2 me-2"></i>Environments
+        </a>
+      </li>
+      <li>
+        <a href="{{ url_for('main.plans') }}"
+           class="nav-link text-white {% if 'plan' in request.endpoint %}active{% endif %}">
+          <i class="bi bi-list-check me-2"></i>Test Plans
+        </a>
+      </li>
+      <li>
+        <a href="{{ url_for('main.runner') }}"
+           class="nav-link text-white {% if request.endpoint == 'main.runner' %}active{% endif %}">
+          <i class="bi bi-play-circle me-2"></i>Run Tests
+        </a>
+      </li>
+      <li>
+        <a href="{{ url_for('main.results') }}"
+           class="nav-link text-white {% if 'result' in request.endpoint %}active{% endif %}">
+          <i class="bi bi-bar-chart-line me-2"></i>Results
+        </a>
+      </li>
+    </ul>
+    <hr>
+    <div class="text-muted small px-2">
+      <i class="bi bi-shield-lock me-1"></i>OAuth2 Client Credentials
+    </div>
+  </nav>
+
+  <!-- ── Page content ─────────────────────────────────────────────────────── -->
+  <div id="page-content" class="flex-grow-1">
+    <!-- Top bar -->
+    <div class="topbar px-4 py-2 border-bottom d-flex align-items-center justify-content-between">
+      <button class="btn btn-sm btn-outline-secondary d-md-none" id="sidebarToggle">
+        <i class="bi bi-list"></i>
+      </button>
+      <div class="text-muted small ms-auto">
+        <i class="bi bi-clock me-1"></i>
+        <span id="clock"></span>
+      </div>
+    </div>
+
+    <!-- Flash messages -->
+    <div class="px-4 pt-3">
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% for cat, msg in messages %}
+          <div class="alert alert-{{ cat }} alert-dismissible fade show" role="alert">
+            {{ msg }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+          </div>
+        {% endfor %}
+      {% endwith %}
+    </div>
+
+    <!-- Main content block -->
+    <div class="px-4 pb-4">
+      {% block content %}{% endblock %}
+    </div>
+  </div>
+</div><!-- #wrapper -->
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+        crossorigin="anonymous"></script>
+<script>
+  // Live clock
+  function tick() {
+    const el = document.getElementById('clock');
+    if (el) el.textContent = new Date().toLocaleTimeString();
+  }
+  setInterval(tick, 1000); tick();
+
+  // Sidebar toggle (mobile)
+  document.getElementById('sidebarToggle')?.addEventListener('click', () => {
+    document.getElementById('sidebar').classList.toggle('show');
+  });
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

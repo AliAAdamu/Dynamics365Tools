@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+{% set is_edit = env is not none and env.get('id') %}
+{% block title %}{{ 'Edit' if is_edit else 'New' }} Environment — D365 DMF Tester{% endblock %}
+
+{% block content %}
+<div class="page-header mb-4">
+  <h2 class="fw-bold">
+    <i class="bi bi-globe2 me-2 text-primary"></i>
+    {{ 'Edit Environment' if is_edit else 'New Environment' }}
+  </h2>
+</div>
+
+<div class="row justify-content-center">
+  <div class="col-lg-7">
+    <div class="card border-0 shadow-sm">
+      <div class="card-body p-4">
+        <form method="POST" action="{{ url_for('main.environment_save') }}" autocomplete="off">
+          {% if is_edit %}
+          <input type="hidden" name="id" value="{{ env.id }}">
+          {% endif %}
+
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Environment Name <span class="text-danger">*</span></label>
+            <input type="text" name="name" class="form-control"
+                   value="{{ env.name if env else '' }}"
+                   placeholder="e.g. UAT, Production, Sandbox"
+                   required>
+            <div class="form-text">A friendly label — only used in this tool.</div>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Base URL <span class="text-danger">*</span></label>
+            <input type="url" name="base_url" class="form-control"
+                   value="{{ env.base_url if env else '' }}"
+                   placeholder="https://contoso.operations.dynamics.com"
+                   required>
+            <div class="form-text">No trailing slash. Must be the D365 root URL.</div>
+          </div>
+
+          <hr class="my-3">
+          <h6 class="fw-semibold text-muted mb-3">
+            <i class="bi bi-shield-lock me-1"></i>OAuth2 Client Credentials
+          </h6>
+
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Tenant ID <span class="text-danger">*</span></label>
+            <input type="text" name="tenant_id" class="form-control font-monospace"
+                   value="{{ env.tenant_id if env else '' }}"
+                   placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                   required>
+          </div>
+
+          <div class="mb-3">
+            <label class="form-label fw-semibold">Client ID <span class="text-danger">*</span></label>
+            <input type="text" name="client_id" class="form-control font-monospace"
+                   value="{{ env.client_id if env else '' }}"
+                   placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+                   required>
+          </div>
+
+          <div class="mb-4">
+            <label class="form-label fw-semibold">
+              Client Secret
+              {% if is_edit %}
+              <span class="text-muted fw-normal">(leave blank to keep existing)</span>
+              {% else %}
+              <span class="text-danger">*</span>
+              {% endif %}
+            </label>
+            <div class="input-group">
+              <input type="password" name="client_secret" id="clientSecret"
+                     class="form-control font-monospace"
+                     placeholder="{{ '••••••••' if is_edit else 'Paste secret here' }}"
+                     {{ 'required' if not is_edit else '' }}
+                     autocomplete="new-password">
+              <button class="btn btn-outline-secondary" type="button"
+                      onclick="toggleSecret()">
+                <i class="bi bi-eye" id="eyeIcon"></i>
+              </button>
+            </div>
+            <div class="form-text text-success">
+              <i class="bi bi-lock-fill me-1"></i>
+              Stored encrypted at rest using Fernet symmetric encryption.
+            </div>
+          </div>
+
+          <div class="d-flex gap-2">
+            <button type="submit" class="btn btn-primary">
+              <i class="bi bi-floppy me-1"></i>Save Environment
+            </button>
+            <a href="{{ url_for('main.environments') }}" class="btn btn-outline-secondary">
+              Cancel
+            </a>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Help card -->
+    <div class="card border-0 shadow-sm mt-3">
+      <div class="card-header bg-transparent fw-semibold small">
+        <i class="bi bi-question-circle me-1 text-info"></i>How to create an App Registration
+      </div>
+      <div class="card-body small text-muted">
+        <ol class="mb-0 ps-3">
+          <li>In <strong>Azure Active Directory</strong>, go to <em>App registrations → New registration</em>.</li>
+          <li>Set a redirect URI of type <em>Web</em> (any value, e.g. <code>http://localhost</code>).</li>
+          <li>Go to <em>Certificates &amp; secrets → New client secret</em> and copy the <strong>Value</strong>.</li>
+          <li>In D365 <em>System administration → Azure Active Directory applications</em>, add the Client ID and map to a user with DMF permissions.</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function toggleSecret() {
+  const input = document.getElementById('clientSecret');
+  const icon  = document.getElementById('eyeIcon');
+  if (input.type === 'password') {
+    input.type = 'text';
+    icon.className = 'bi bi-eye-slash';
+  } else {
+    input.type = 'password';
+    icon.className = 'bi bi-eye';
+  }
+}
+</script>
+{% endblock %}

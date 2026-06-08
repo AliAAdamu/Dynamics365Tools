@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Environments — D365 DMF Tester{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex align-items-center justify-content-between mb-4">
+  <div>
+    <h2 class="fw-bold mb-0"><i class="bi bi-globe2 me-2 text-primary"></i>Environments</h2>
+    <p class="text-muted mb-0">Manage your Dynamics 365 environments and OAuth credentials</p>
+  </div>
+  <a href="{{ url_for('main.environment_new') }}" class="btn btn-primary">
+    <i class="bi bi-plus-lg me-1"></i>Add Environment
+  </a>
+</div>
+
+{% if environments %}
+<div class="row g-3">
+  {% for env in environments %}
+  <div class="col-md-6 col-xl-4">
+    <div class="card border-0 shadow-sm h-100">
+      <div class="card-body">
+        <div class="d-flex align-items-start justify-content-between mb-2">
+          <h5 class="card-title mb-0 fw-semibold">
+            <i class="bi bi-server me-2 text-primary"></i>{{ env.name }}
+          </h5>
+          <span class="badge bg-secondary">ENV</span>
+        </div>
+        <div class="mb-3">
+          <div class="text-muted small mb-1">
+            <i class="bi bi-link-45deg me-1"></i>
+            <a href="{{ env.base_url }}" target="_blank" rel="noopener noreferrer"
+               class="text-truncate d-inline-block" style="max-width:220px">
+              {{ env.base_url }}
+            </a>
+          </div>
+          <div class="text-muted small mb-1">
+            <i class="bi bi-building me-1"></i>Tenant: {{ env.tenant_id[:8] }}…
+          </div>
+          <div class="text-muted small">
+            <i class="bi bi-key me-1"></i>Client: {{ env.client_id[:8] }}…
+          </div>
+        </div>
+        <div class="d-flex gap-2">
+          <button class="btn btn-sm btn-outline-success flex-fill"
+                  onclick="testConnection('{{ env.id }}', this)">
+            <i class="bi bi-wifi me-1"></i>Test
+          </button>
+          <a href="{{ url_for('main.environment_edit', env_id=env.id) }}"
+             class="btn btn-sm btn-outline-secondary flex-fill">
+            <i class="bi bi-pencil me-1"></i>Edit
+          </a>
+          <form method="POST"
+                action="{{ url_for('main.environment_delete', env_id=env.id) }}"
+                onsubmit="return confirm('Delete environment \'{{ env.name }}\'?')">
+            <button type="submit" class="btn btn-sm btn-outline-danger">
+              <i class="bi bi-trash"></i>
+            </button>
+          </form>
+        </div>
+        <div id="test-result-{{ env.id }}" class="mt-2 small"></div>
+      </div>
+      <div class="card-footer text-muted bg-transparent border-top small">
+        <i class="bi bi-calendar3 me-1"></i>
+        Updated {{ env.updated_at[:10] if env.updated_at else 'N/A' }}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card border-0 shadow-sm">
+  <div class="card-body text-center py-5">
+    <i class="bi bi-globe2 text-muted" style="font-size:3rem"></i>
+    <h5 class="mt-3">No environments yet</h5>
+    <p class="text-muted">Add your first Dynamics 365 environment to get started.</p>
+    <a href="{{ url_for('main.environment_new') }}" class="btn btn-primary">
+      <i class="bi bi-plus-lg me-1"></i>Add Environment
+    </a>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function testConnection(envId, btn) {
+  const resultEl = document.getElementById(`test-result-${envId}`);
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Testing…';
+  resultEl.innerHTML = '';
+
+  try {
+    const resp = await fetch(`/api/environments/${envId}/test`, { method: 'POST' });
+    const data = await resp.json();
+    if (data.ok) {
+      resultEl.innerHTML = `<span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>Connected — ${data.definition_groups} definition groups found</span>`;
+    } else {
+      resultEl.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>${data.error}</span>`;
+    }
+  } catch (e) {
+    resultEl.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>Request failed</span>`;
+  }
+
+  btn.disabled = false;
+  btn.innerHTML = '<i class="bi bi-wifi me-1"></i>Test';
+}
+</script>
+{% endblock %}

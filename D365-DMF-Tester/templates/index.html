@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — D365 DMF Tester{% endblock %}
+
+{% block content %}
+<div class="page-header mb-4">
+  <h2 class="fw-bold"><i class="bi bi-speedometer2 me-2 text-primary"></i>Dashboard</h2>
+  <p class="text-muted">Dynamics 365 Data Management Framework — load test runner</p>
+</div>
+
+<!-- Stats row -->
+<div class="row g-3 mb-4">
+  <div class="col-sm-6 col-xl-3">
+    <div class="card stat-card border-0 shadow-sm h-100">
+      <div class="card-body d-flex align-items-center gap-3">
+        <div class="stat-icon bg-primary-subtle text-primary rounded-3 p-3">
+          <i class="bi bi-globe2 fs-3"></i>
+        </div>
+        <div>
+          <div class="fs-1 fw-bold lh-1">{{ env_count }}</div>
+          <div class="text-muted small">Environments</div>
+        </div>
+      </div>
+      <div class="card-footer bg-transparent border-0 pt-0">
+        <a href="{{ url_for('main.environments') }}" class="small text-decoration-none">
+          Manage <i class="bi bi-arrow-right"></i>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-sm-6 col-xl-3">
+    <div class="card stat-card border-0 shadow-sm h-100">
+      <div class="card-body d-flex align-items-center gap-3">
+        <div class="stat-icon bg-success-subtle text-success rounded-3 p-3">
+          <i class="bi bi-list-check fs-3"></i>
+        </div>
+        <div>
+          <div class="fs-1 fw-bold lh-1">{{ plan_count }}</div>
+          <div class="text-muted small">Test Plans</div>
+        </div>
+      </div>
+      <div class="card-footer bg-transparent border-0 pt-0">
+        <a href="{{ url_for('main.plans') }}" class="small text-decoration-none">
+          Manage <i class="bi bi-arrow-right"></i>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-sm-6 col-xl-3">
+    <div class="card stat-card border-0 shadow-sm h-100">
+      <div class="card-body d-flex align-items-center gap-3">
+        <div class="stat-icon bg-warning-subtle text-warning rounded-3 p-3">
+          <i class="bi bi-play-circle fs-3"></i>
+        </div>
+        <div>
+          <div class="fs-1 fw-bold lh-1">—</div>
+          <div class="text-muted small">Run Tests Now</div>
+        </div>
+      </div>
+      <div class="card-footer bg-transparent border-0 pt-0">
+        <a href="{{ url_for('main.runner') }}" class="small text-decoration-none">
+          Go to runner <i class="bi bi-arrow-right"></i>
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-sm-6 col-xl-3">
+    <div class="card stat-card border-0 shadow-sm h-100">
+      <div class="card-body d-flex align-items-center gap-3">
+        <div class="stat-icon bg-info-subtle text-info rounded-3 p-3">
+          <i class="bi bi-bar-chart-line fs-3"></i>
+        </div>
+        <div>
+          <div class="fs-1 fw-bold lh-1">{{ recent_results | length }}</div>
+          <div class="text-muted small">Recent Results</div>
+        </div>
+      </div>
+      <div class="card-footer bg-transparent border-0 pt-0">
+        <a href="{{ url_for('main.results') }}" class="small text-decoration-none">
+          View all <i class="bi bi-arrow-right"></i>
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Quick actions -->
+<div class="row g-3 mb-4">
+  <div class="col-md-6">
+    <div class="card border-0 shadow-sm h-100">
+      <div class="card-header fw-semibold bg-transparent">
+        <i class="bi bi-lightning me-1 text-warning"></i>Quick Actions
+      </div>
+      <div class="card-body d-flex flex-column gap-2">
+        <a href="{{ url_for('main.environment_new') }}" class="btn btn-outline-primary btn-sm text-start">
+          <i class="bi bi-plus-circle me-2"></i>Add Environment
+        </a>
+        <a href="{{ url_for('main.plan_new') }}" class="btn btn-outline-success btn-sm text-start">
+          <i class="bi bi-plus-circle me-2"></i>Create Test Plan
+        </a>
+        <a href="{{ url_for('main.runner') }}" class="btn btn-primary btn-sm text-start">
+          <i class="bi bi-play-fill me-2"></i>Run Tests
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-md-6">
+    <div class="card border-0 shadow-sm h-100">
+      <div class="card-header fw-semibold bg-transparent">
+        <i class="bi bi-clock-history me-1 text-info"></i>Recent Runs
+      </div>
+      <div class="card-body p-0">
+        {% if recent_results %}
+        <ul class="list-group list-group-flush">
+          {% for r in recent_results %}
+          <li class="list-group-item d-flex justify-content-between align-items-center py-2 px-3">
+            <div>
+              <div class="fw-semibold small">{{ r.plan_name }}</div>
+              <div class="text-muted" style="font-size:0.75rem">
+                {{ r.environment_name }} · {{ r.mode }} · {{ r.iterations }}×
+              </div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              {% set s = r.summary %}
+              {% if s.failed and s.failed > 0 %}
+                <span class="badge bg-danger">{{ s.failed }} failed</span>
+              {% else %}
+                <span class="badge bg-success">OK</span>
+              {% endif %}
+              <a href="{{ url_for('main.result_detail', result_id=r.id) }}"
+                 class="btn btn-sm btn-outline-secondary py-0">
+                <i class="bi bi-eye"></i>
+              </a>
+            </div>
+          </li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <div class="text-muted text-center py-4 small">No runs yet — go run some tests!</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- How it works -->
+<div class="card border-0 shadow-sm">
+  <div class="card-header fw-semibold bg-transparent">
+    <i class="bi bi-info-circle me-1 text-primary"></i>How It Works
+  </div>
+  <div class="card-body">
+    <div class="row g-3 text-center">
+      <div class="col-sm-3">
+        <div class="step-num">1</div>
+        <strong>Add Environment</strong>
+        <p class="text-muted small mt-1">Store your D365 URL, Tenant ID and OAuth client credentials securely.</p>
+      </div>
+      <div class="col-sm-3">
+        <div class="step-num">2</div>
+        <strong>Create Test Plan</strong>
+        <p class="text-muted small mt-1">Configure an import (upload .zip package) or export (pull from DMF).</p>
+      </div>
+      <div class="col-sm-3">
+        <div class="step-num">3</div>
+        <strong>Run Tests</strong>
+        <p class="text-muted small mt-1">Choose parallel or serial mode, set iteration count (up to 50) and fire.</p>
+      </div>
+      <div class="col-sm-3">
+        <div class="step-num">4</div>
+        <strong>Analyse Results</strong>
+        <p class="text-muted small mt-1">See per-execution timing, success/failure breakdown and job status.</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,156 @@
+/* ── D365 DMF Tester — Custom Styles ─────────────────────────────────────── */
+
+/* Sidebar */
+:root {
+  --sidebar-width: 230px;
+  --sidebar-bg: #1a2233;
+  --sidebar-active: #2d3a52;
+  --topbar-h: 48px;
+}
+
+body {
+  background: #f4f6f9;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+#wrapper {
+  min-height: 100vh;
+}
+
+#sidebar {
+  width: var(--sidebar-width);
+  min-height: 100vh;
+  background: var(--sidebar-bg);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+#sidebar .brand {
+  font-size: 0.95rem;
+}
+
+#sidebar .nav-link {
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  transition: background 0.15s;
+}
+
+#sidebar .nav-link:hover {
+  background: rgba(255,255,255,0.1);
+}
+
+#sidebar .nav-link.active {
+  background: var(--sidebar-active);
+  font-weight: 600;
+}
+
+/* Top bar */
+.topbar {
+  background: #fff;
+  height: var(--topbar-h);
+  border-bottom: 1px solid #e5e7eb;
+}
+
+/* Page header */
+.page-header {
+  padding-top: 1.25rem;
+}
+
+/* Stat cards */
+.stat-card {
+  border-radius: 12px;
+}
+
+.stat-icon {
+  width: 56px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+}
+
+/* Step numbers on dashboard */
+.step-num {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: #e7f0ff;
+  color: #0d6efd;
+  font-weight: 700;
+  font-size: 1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 0.5rem;
+}
+
+/* Cards */
+.card {
+  border-radius: 10px;
+}
+
+.card-header {
+  border-radius: 10px 10px 0 0 !important;
+}
+
+/* Progress bars */
+.progress {
+  border-radius: 8px;
+  background: #e9ecef;
+}
+
+/* Tables */
+.table > :not(caption) > * > * {
+  padding: 0.6rem 0.75rem;
+}
+
+/* Mobile sidebar */
+@media (max-width: 768px) {
+  #sidebar {
+    position: fixed;
+    z-index: 1000;
+    transform: translateX(-100%);
+    transition: transform 0.25s;
+  }
+  #sidebar.show {
+    transform: translateX(0);
+  }
+}
+
+/* Font-monospace overrides */
+.font-monospace {
+  font-size: 0.83rem;
+}
+
+/* Spinner tweak */
+.spinner-border-sm {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-width: 0.15em;
+}
+
+/* Sticky top offset for run config */
+@media (min-width: 992px) {
+  .sticky-top { top: 1rem !important; }
+}
+
+/* Badge sizing consistency */
+.badge {
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+/* Alert slim */
+.alert {
+  border-radius: 8px;
+  font-size: 0.875rem;
+}
+
+/* List group borderless */
+.list-group-item:first-child { border-top: 0; }
+.list-group-item:last-child  { border-bottom: 0; }

@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% set s = result.summary %}
+{% block title %}Result {{ result.id[:8] }} — D365 DMF Tester{% endblock %}
+{% block head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"
+        crossorigin="anonymous"></script>
+{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex align-items-center justify-content-between mb-4">
+  <div>
+    <h2 class="fw-bold mb-0">
+      <i class="bi bi-bar-chart-line me-2 text-info"></i>
+      {{ result.plan_name }}
+    </h2>
+    <p class="text-muted mb-0">
+      {{ result.environment_name }} ·
+      <span class="badge {{ 'bg-info' if result.mode == 'parallel' else 'bg-secondary' }}">{{ result.mode }}</span>
+      · {{ result.iterations }} iterations ·
+      {{ result.started_at[:10] if result.started_at else '' }}
+    </p>
+  </div>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('main.results') }}" class="btn btn-outline-secondary btn-sm">
+      <i class="bi bi-arrow-left me-1"></i>Back
+    </a>
+    <form method="POST" action="{{ url_for('main.result_delete', result_id=result.id) }}"
+          onsubmit="return confirm('Delete this result?')">
+      <button type="submit" class="btn btn-sm btn-outline-danger">
+        <i class="bi bi-trash me-1"></i>Delete
+      </button>
+    </form>
+  </div>
+</div>
+
+<!-- Summary cards -->
+<div class="row g-3 mb-4">
+  {% set stats = [
+    ('Total', s.total, 'text-primary', 'check2-all'),
+    ('Succeeded', s.succeeded, 'text-success', 'check-circle-fill'),
+    ('Failed', s.failed, 'text-danger', 'x-circle-fill'),
+    ('Avg Duration', ('{:,} ms'.format(s.avg_duration_ms)) if s.avg_duration_ms else '—', 'text-info', 'stopwatch'),
+    ('Min Duration', ('{:,} ms'.format(s.min_duration_ms)) if s.min_duration_ms else '—', 'text-muted', 'arrow-down-circle'),
+    ('Max Duration', ('{:,} ms'.format(s.max_duration_ms)) if s.max_duration_ms else '—', 'text-warning', 'arrow-up-circle'),
+  ] %}
+  {% for label, val, cls, icon in stats %}
+  <div class="col-6 col-md-4 col-xl-2">
+    <div class="card border-0 shadow-sm h-100 text-center">
+      <div class="card-body py-3">
+        <i class="bi bi-{{ icon }} {{ cls }} fs-4"></i>
+        <div class="h4 fw-bold mt-1 mb-0 {{ cls }}">{{ val }}</div>
+        <div class="text-muted small">{{ label }}</div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- Charts -->
+{% if result.executions %}
+<div class="row g-3 mb-4">
+  <div class="col-md-8">
+    <div class="card border-0 shadow-sm">
+      <div class="card-header fw-semibold bg-transparent">
+        <i class="bi bi-bar-chart me-1"></i>Duration per Iteration (ms)
+      </div>
+      <div class="card-body">
+        <canvas id="durChart" style="max-height:250px"></canvas>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card border-0 shadow-sm h-100">
+      <div class="card-header fw-semibold bg-transparent">
+        <i class="bi bi-pie-chart me-1"></i>Success vs Failed
+      </div>
+      <div class="card-body d-flex align-items-center justify-content-center">
+        <canvas id="pieChart" style="max-height:200px"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<!-- Execution detail table -->
+<div class="card border-0 shadow-sm">
+  <div class="card-header fw-semibold bg-transparent">
+    <i class="bi bi-table me-1"></i>Execution Details
+  </div>
+  <div class="card-body p-0">
+    <table class="table table-hover table-sm align-middle mb-0">
+      <thead class="table-light">
+        <tr>
+          <th class="ps-3">#</th>
+          <th>Status</th>
+          <th>Job Status</th>
+          <th>Duration</th>
+          <th>Started</th>
+          <th>Execution ID</th>
+          <th>Error</th>
+          {% if result.operation == 'export' %}<th></th>{% endif %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in result.executions | sort(attribute='index') %}
+        <tr>
+          <td class="ps-3 fw-semibold">{{ e.index + 1 }}</td>
+          <td>
+            <span class="badge {{ 'bg-success' if e.status == 'success' else 'bg-danger' }}">
+              {{ e.status }}
+            </span>
+          </td>
+          <td>
+            {% set jmap = {'Succeeded':'success','Failed':'danger','Canceled':'secondary','Running':'info','Timeout':'warning','Error':'danger'} %}
+            <span class="badge bg-{{ jmap.get(e.job_status,'light') }} {{ 'text-dark' if e.job_status == 'Timeout' else '' }}">
+              {{ e.job_status or '—' }}
+            </span>
+          </td>
+          <td class="font-monospace">
+            {{ '{:,}'.format(e.duration_ms) }} ms
+          </td>
+          <td class="text-muted small">
+            {{ e.started_at[:19] | replace('T',' ') if e.started_at else '—' }}
+          </td>
+          <td class="font-monospace small text-truncate" style="max-width:150px"
+              title="{{ e.execution_id }}">
+            {{ e.execution_id or '—' }}
+          </td>
+          <td class="small text-danger">
+            {{ e.error_message or '' }}
+          </td>
+          {% if result.operation == 'export' %}
+          <td>
+            {% if e.job_status == 'Succeeded' and e.execution_id %}
+            <a href="{{ url_for('main.result_download', result_id=result.id, execution_id=e.execution_id) }}"
+               class="btn btn-sm btn-outline-success" title="Download exported package">
+              <i class="bi bi-download me-1"></i>Download
+            </a>
+            {% endif %}
+          </td>
+          {% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+{% if result.executions %}
+const executions = {{ result.executions | tojson }};
+const sorted = [...executions].sort((a,b) => a.index - b.index);
+const labels = sorted.map(e => `#${e.index + 1}`);
+const durations = sorted.map(e => e.duration_ms || 0);
+const colors = sorted.map(e => e.status === 'success'
+  ? 'rgba(25,135,84,0.8)'
+  : 'rgba(220,53,69,0.8)');
+
+// Bar chart — duration per iteration
+new Chart(document.getElementById('durChart'), {
+  type: 'bar',
+  data: {
+    labels,
+    datasets: [{
+      label: 'Duration (ms)',
+      data: durations,
+      backgroundColor: colors,
+      borderRadius: 4,
+    }]
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { display: false } },
+    scales: {
+      y: { beginAtZero: true, ticks: { callback: v => v.toLocaleString() } }
+    }
+  }
+});
+
+// Pie chart
+const succeeded = executions.filter(e => e.status === 'success').length;
+const failed = executions.filter(e => e.status === 'failed').length;
+new Chart(document.getElementById('pieChart'), {
+  type: 'doughnut',
+  data: {
+    labels: ['Succeeded', 'Failed'],
+    datasets: [{
+      data: [succeeded, failed],
+      backgroundColor: ['rgba(25,135,84,0.8)', 'rgba(220,53,69,0.8)'],
+      borderWidth: 0,
+    }]
+  },
+  options: {
+    responsive: true,
+    cutout: '65%',
+    plugins: {
+      legend: { position: 'bottom' }
+    }
+  }
+});
+{% endif %}
+</script>
+{% endblock %}
