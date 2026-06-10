@@ -164,15 +164,17 @@ def _single_execution(run_id: str, index: int, plan: dict, env: dict, token: str
         else:
             raise ValueError(f"Unknown operation '{op}'")
 
+        job_status = result.get("job_status", "")
+        exec_failed = job_status in ("Failed", "PartiallySucceeded", "Error", "Canceled", "PollError", "Timeout")
         return {
             "index": index,
             "started_at": started_at,
             "completed_at": _now(),
             "duration_ms": int((time.monotonic() - t0) * 1000),
-            "status": "success",
+            "status": "failed" if exec_failed else "success",
             "execution_id": result.get("execution_id", ""),
-            "job_status": result.get("job_status", ""),
-            "error_message": None,
+            "job_status": job_status,
+            "error_message": f"DMF job ended with status: {job_status}" if exec_failed else None,
         }
     except Exception as exc:  # noqa: BLE001
         return {

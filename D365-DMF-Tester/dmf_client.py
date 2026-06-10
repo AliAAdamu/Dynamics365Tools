@@ -6,7 +6,7 @@ from typing import Callable
 
 import requests
 
-_TERMINAL_STATUSES = {"Succeeded", "Failed", "Canceled"}
+_TERMINAL_STATUSES = {"Succeeded", "PartiallySucceeded", "Failed", "Canceled", "Error"}
 _POLL_MAX_RETRIES = 3
 
 
