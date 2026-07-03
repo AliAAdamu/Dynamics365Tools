@@ -21,6 +21,10 @@ file is at [`docs/Fabric-Dynamics365FO-RowCounterSmall.mp4`](docs/demo.webm).</s
 
 <video src="docs/Fabric-Dynamics365FO-RowCounterSmall.mp4" controls width="720"></video>
 
+### Current UI (v1.1.0.1)
+
+![Fabric ↔ D365 Row Counter UI showing Fabric RowVersion, Fabric Last Modified, D365 RowVersion, D365 Last Modified and Latency columns](docs/ui-v1.1.0.1.png)
+
 ---
 
 ## What's in this repo
