@@ -9,7 +9,17 @@ to the CLI is automatically picked up here.
 - Form-based connection settings (Fabric endpoint, database, D365 URI, auth, etc.)
 - Choose D365 service version (**v1** Direct SQL or **v2** X++ / Fabric Link)
 - Live progress bar while counting tables
-- Sortable / filterable results grid with colored Match / Drift / Anomaly / N/A / Error badges
+- Sortable / filterable results grid showing all comparison columns:
+  - **Fabric Rows** / **D365 Rows** — raw counts from each side
+  - **Fabric RowVersion** — `MAX(SYSROWVERSION)` from the Fabric table
+  - **Fabric Last Modified** — `MAX(MODIFIEDDATETIME)` from Fabric when the column is present; otherwise an estimate is provided and marked `(est.)`
+  - **D365 RowVersion** — `MAX(SYSROWVERSION)` from D365 (0 = empty / unavailable)
+  - **D365 Last Modified** — last modification timestamp from D365; marked `(est.)` when not directly available
+  - **Latency** — `D365 Last Modified − Fabric Last Modified`; how far behind the Fabric mirror is (e.g. `3d 4h`, `45m 12s`, `0s`, `N/A`)
+  - **Delta** — signed row-count difference (D365 − Fabric)
+  - **Status** badge — **Match** / **Drift** / **Anomaly** / **N/A** / **Error** with color coding
+  - **Last SinkModifiedOn** — most recent Fabric mirror timestamp (for reference)
+- App version displayed in the sidebar and page subtitle
 - Summary chips per status
 - One-click **Download CSV** and **Download HTML report** buttons (timestamped)
 

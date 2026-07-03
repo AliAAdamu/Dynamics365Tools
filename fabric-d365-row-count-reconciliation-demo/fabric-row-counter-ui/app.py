@@ -19,16 +19,23 @@ import requests
 import streamlit as st
 
 # Import the existing CLI as a library (no code duplication).
-# When frozen by PyInstaller, count_rows.py is bundled next to app.py.
-# In dev, it lives in the sibling folder.
+# Uses importlib to load directly from the .py file path, bypassing Python's
+# module cache (.pyc) so the latest source is always used.
+import importlib.util as _ilu
+
 THIS_DIR = Path(__file__).parent.resolve()
+_cr_path = None
 for candidate in (THIS_DIR, THIS_DIR.parent / "fabric-row-counter"):
     if (candidate / "count_rows.py").exists():
-        if str(candidate) not in sys.path:
-            sys.path.insert(0, str(candidate))
+        _cr_path = candidate / "count_rows.py"
         break
 
-import count_rows as cr  # type: ignore
+if _cr_path is None:
+    raise FileNotFoundError("count_rows.py not found")
+
+_spec = _ilu.spec_from_file_location("count_rows", str(_cr_path))
+cr = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(cr)  # type: ignore
 
 STATUS_COLORS = {
     "Match":   ("#0f5132", "#d1e7dd"),
@@ -40,13 +47,15 @@ STATUS_COLORS = {
 
 st.set_page_config(page_title="Fabric Row Counter", page_icon="📊", layout="wide")
 st.title("📊 Fabric ↔ Dynamics 365 Row Counter")
-st.caption("Compare Fabric Warehouse row counts to the source D365 F&O environment.")
+_ver = getattr(cr, "APP_VERSION", "legacy")
+st.caption(f"Compare Fabric Warehouse row counts to the source D365 F&O environment. &nbsp; `v{_ver}`")
 
 
 # ---------------------------------------------------------------------------
 # Sidebar — connection settings
 # ---------------------------------------------------------------------------
 st.sidebar.header("⚙️ Settings")
+st.sidebar.caption(f"App version **{_ver}** | loaded from `{_cr_path.name}`")
 
 with st.sidebar.expander("Fabric", expanded=True):
     fabric_endpoint = st.text_input(
@@ -69,13 +78,13 @@ with st.sidebar.expander("Dynamics 365 F&O", expanded=True):
     d365_auth = st.selectbox("Auth mode", ["interactive", "serviceprincipal"], index=0, disabled=skip_d365)
     service_version = st.radio(
         "Service version",
-        ["v2", "v1"],
+        ["v1", "v2"],
         index=0,
         horizontal=True,
-        format_func=lambda v: {"v1": "v1 — Direct SQL (faster)",
-                                "v2": "v2 — X++ (matches Fabric Link)"}[v],
+        format_func=lambda v: {"v1": "v1 — Direct SQL (faster, default)",
+                                "v2": "v2 — X++ (edge-case fallback)"}[v],
         disabled=skip_d365,
-        help="v1 calls getTableRecordCount; v2 calls getTableRecordCountV2.",
+        help="v1 calls getTableRecordCount (default). v2 calls getTableRecordCountV2 — use only when v1 and Fabric counts disagree and you need to rule out orphan-row noise.",
     )
 
 with st.sidebar.expander("Service principal (optional)", expanded=False):
@@ -141,7 +150,11 @@ def run_comparison(cfg: cr.Config):
 
     if cfg.skip_d365 or not cfg.d365_uri:
         progress.progress(1.0, text="Done (Fabric only)")
-        return [(name, "-", n, None, "-", "N/A", sink) for name, n, sink in fabric_rows]
+        return [
+            (name, "-", n, None, "-", "N/A", sink, None, None, False, "N/A",
+             fab_srv, fab_mod, False)
+            for name, n, sink, fab_srv, fab_mod in fabric_rows
+        ]
 
     progress.progress(0.4, text="Authenticating to D365…")
     token = cr.get_d365_token(cfg)
@@ -149,14 +162,19 @@ def run_comparison(cfg: cr.Config):
 
     rows = []
     total = len(fabric_rows)
-    for i, (fabric_name, fabric_count, sink) in enumerate(fabric_rows, 1):
+    for i, (fabric_name, fabric_count, sink, fabric_srv, fabric_mod) in enumerate(fabric_rows, 1):
         d365_name = cr.fabric_to_d365_name(fabric_name, cfg.table_name_map)
         status_box.write(f"Querying D365 for **{d365_name}** ({i}/{total})…")
-        d365_count_val, err, not_found = cr.d365_count(
-            session, cfg.d365_uri, token, d365_name, cfg.d365_service_version
+        d365_count_val, err, not_found, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est = cr.d365_count(
+            session, cfg.d365_uri, token, d365_name, cfg.d365_service_version,
+            fabric_srv=fabric_srv, fabric_mod=fabric_mod,
         )
         status, delta = cr.classify(fabric_count, d365_count_val, not_found, err)
-        rows.append((fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink))
+        fabric_last_mod = fabric_mod or fabric_synced_mod
+        is_fabric_mod_est = fabric_mod is None and fabric_synced_mod is not None
+        latency = cr.compute_latency(last_mod, fabric_mod, fabric_synced_mod)
+        rows.append((fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink,
+                     last_srv, last_mod, is_est, latency, fabric_srv, fabric_last_mod, is_fabric_mod_est))
         progress.progress(0.4 + 0.6 * i / total, text=f"D365 lookup {i}/{total}")
 
     status_box.empty()
@@ -176,7 +194,24 @@ def render_results(rows):
     df = pd.DataFrame(rows, columns=[
         "Fabric Table", "D365 Table", "Fabric Rows", "D365 Rows",
         "Delta", "Status", "Last SinkModifiedOn",
+        "D365 RowVersion", "D365 Last Modified", "D365 Estimated", "Latency",
+        "Fabric RowVersion", "Fabric Last Modified", "Fabric Mod Estimated",
     ])
+    # Merge estimated flags into datetime strings for display
+    df["D365 Last Modified"] = df.apply(
+        lambda r: (
+            f'{r["D365 Last Modified"]} (est.)' if r["D365 Estimated"] and r["D365 Last Modified"]
+            else (r["D365 Last Modified"] or "—")
+        ),
+        axis=1,
+    )
+    df["Fabric Last Modified"] = df.apply(
+        lambda r: (
+            f'{r["Fabric Last Modified"]} (est.)' if r["Fabric Mod Estimated"] and r["Fabric Last Modified"]
+            else (r["Fabric Last Modified"] or "—")
+        ),
+        axis=1,
+    )
 
     # Summary chips
     counts = df["Status"].value_counts().to_dict()
@@ -199,14 +234,25 @@ def render_results(rows):
         options=["Match", "Drift", "Anomaly", "N/A", "Error"],
         default=[],
     )
-    view = df if not flt else df[df["Status"].isin(flt)]
+    base = df if not flt else df[df["Status"].isin(flt)]
+    display_cols = [
+        "Fabric Table", "D365 Table",
+        "Fabric Rows", "Fabric RowVersion", "Fabric Last Modified",
+        "D365 Rows", "D365 RowVersion", "D365 Last Modified",
+        "Latency", "Delta", "Status", "Last SinkModifiedOn",
+    ]
+    view = base[display_cols].copy()
+    # Pre-format numeric columns as strings to avoid "None" display in newer Streamlit/pandas.
+    def _fi(v, comma=False) -> str:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return "—"
+        return f"{int(v):,}" if comma else str(int(v))
+    view["Fabric Rows"]       = view["Fabric Rows"].apply(lambda v: _fi(v, comma=True))
+    view["Fabric RowVersion"] = view["Fabric RowVersion"].apply(_fi)
+    view["D365 Rows"]         = view["D365 Rows"].apply(lambda v: _fi(v, comma=True))
+    view["D365 RowVersion"]   = view["D365 RowVersion"].apply(_fi)
 
-    styled = (
-        view.style
-        .map(style_status, subset=["Status"])
-        .format({"Fabric Rows": "{:,}",
-                 "D365 Rows": lambda v: "-" if v is None or pd.isna(v) else f"{int(v):,}"})
-    )
+    styled = view.style.map(style_status, subset=["Status"])
     st.dataframe(styled, use_container_width=True, height=560)
 
     # Downloads

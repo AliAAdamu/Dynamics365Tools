@@ -91,21 +91,24 @@ The service exposes two operations:
 
 | Operation | Backend | When to use |
  | --------- | ------- | ----------- |
- | `getTableRecordCount`   | Direct SQL `COUNT(*)` against AxDB | **Fastest** — raw physical row count, no X++ overhead. |
- | `getTableRecordCountV2` | X++ `select crossCompany count(RecId) from <Table>` | **Recommended for parity validation** — uses the same code path Fabric Link uses, so the result is guaranteed to match. |
+ | `getTableRecordCount` ⭐ **default** | Direct SQL `COUNT(*)` against AxDB | **Preferred** — fastest, no X++ overhead. Use this in normal operation. |
+ | `getTableRecordCountV2` | X++ `select crossCompany count(RecId) from <Table>` | **Edge-case fallback only** — uses the same code path as Fabric Link. Switch to this only when V1 shows a persistent Anomaly and you need to rule out orphan-row noise. |
  
- > ⚠️ **`getTableRecordCount` (V1) and Fabric Link can disagree.**
- > The direct SQL count includes **orphan records** — for example, rows that
- > still exist physically but belong to a **removed legal entity (DataAreaId)**.
- > Fabric Link skips those rows because it goes through the X++ kernel, which
- > applies the cross-company / DataAreaId filtering. If you see a small
- > persistent **Anomaly** with V1, switch to V2 to confirm whether it's real
+ > **V1 is the recommended default.** It is significantly faster and sufficient
+ > for the vast majority of reconciliation use-cases.
+ >
+ > **When to switch to V2:** The direct SQL count includes **orphan records** —
+ > rows that still exist physically but belong to a **removed legal entity
+ > (DataAreaId)**. Fabric Link skips those rows because it goes through the
+ > X++ kernel. If you see a small, persistent **Anomaly** with V1 that you
+ > cannot explain by recent data changes, run V2 to confirm whether it is real
  > drift or just orphan rows being counted.
 
 Request body:
 ```json
 { "_request": { "TableName": "CUSTTABLE", "RequestId": "any-id" } }
 ```
+> `FabricLastSysRowVersion` (optional `int64`) can be added to the request body when the Fabric table has no `MODIFIEDDATETIME` column. D365 uses it to resolve the modification time of the record last synced to Fabric.
 
 Response:
 ```json
@@ -115,9 +118,17 @@ Response:
   "Message": "Record count retrieved successfully",
   "TableName": "CUSTTABLE",
   "RequestId": "any-id",
-  "RecordCount": 72459
+  "RecordCount": 72459,
+  "LastSysRowVersion": 9876543210,
+  "LastModifiedDateTime": "/Date(1745916522000)/",
+  "IsEstimated": false,
+  "FabricSyncedModifiedDateTime": "/Date(1745913000000)/",
+  "IsFabricSyncEstimated": false
 }
 ```
+
+> `IsEstimated: true` means the D365 table has no `MODIFIEDDATETIME` column; the timestamp is an estimate.
+> `FabricSyncedModifiedDateTime` / `IsFabricSyncEstimated` are only populated when `FabricLastSysRowVersion` was included in the request; same logic applies.
 
 ### 🔧 Customizing the service name
 
@@ -211,12 +222,15 @@ full list of environment variables (auth modes, table filters,
 
 ## Sample output
 
-| Fabric Table        | D365 Table     | Fabric Rows | D365 Rows | Delta | Status | Last SinkModifiedOn |
-| ------------------- | -------------- | ----------: | --------: | ----: | ------ | ------------------- |
-| dbo.custtable       | CUSTTABLE      |      72,444 |    72,444 |     0 | Match  | 2026-04-28 14:46:52 |
-| dbo.custinvoicejour | CUSTINVOICEJOUR |     14,555 |    14,555 |     0 | Match  | 2026-04-29 08:55:27 |
-| dbo.batchhistory    | BATCHHISTORY   |     293,809 |   294,016 |  +207 | Drift  | 2026-04-29 16:40:26 |
-| dbo.bot             | BOT            |          40 |         – |     – | N/A    | 2026-04-28 09:09:55 |
+| Fabric Table        | D365 Table      | Fabric Rows | Fabric RowVersion | Fabric Last Modified | D365 Rows | D365 RowVersion | D365 Last Modified  | Latency  | Delta | Status | Last SinkModifiedOn |
+| ------------------- | --------------- | ----------: | ----------------: | -------------------- | --------: | --------------: | ------------------- | -------- | ----: | ------ | ------------------- |
+| dbo.custtable       | CUSTTABLE       |      72,444 |    9,876,543,100  | 2026-04-28 14:44:00  |    72,444 |  9,876,543,210  | 2026-04-28 14:45:00 | 1m 0s    |     0 | Match  | 2026-04-28 14:46:52 |
+| dbo.custinvoicejour | CUSTINVOICEJOUR |      14,555 |    9,876,501,100  | 2026-04-29 08:53:00  |    14,555 |  9,876,501,234  | 2026-04-29 08:54:10 | 1m 10s   |     0 | Match  | 2026-04-29 08:55:27 |
+| dbo.batchhistory    | BATCHHISTORY    |     293,809 |    9,876,498,900  | 2026-04-29 16:35:00  |   294,016 |  9,876,499,001  | 2026-04-29 16:38:00 | 3m 0s    |  +207 | Drift  | 2026-04-29 16:40:26 |
+| dbo.bot             | BOT             |          40 |                 – | –                    |         – |               – | –                   | N/A      |     – | N/A    | 2026-04-28 09:09:55 |
+
+> **Latency** is `D365 Last Modified − Fabric Last Modified` — how far behind the Fabric mirror is relative to the most recent D365 change.
+> Both **Fabric Last Modified** and **D365 Last Modified** may show `(est.)` when `MODIFIEDDATETIME` is not available and a value is estimated.
 
 A timestamped **HTML report** and **CSV** are written next to the script /
 exe on every run.

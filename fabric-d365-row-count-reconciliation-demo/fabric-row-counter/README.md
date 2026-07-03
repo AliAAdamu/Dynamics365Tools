@@ -14,6 +14,12 @@ Small Python app that connects to a Microsoft Fabric **Warehouse** or **Lakehous
   - **Error** — count could not be retrieved
 - Excludes soft-deleted rows from Fabric (`IsDelete = 1`) when the column is present.
 - Reports the latest `SinkModifiedOn` per table (when the column is present) so you can see how fresh the mirrored data is.
+- Retrieves per-table metadata from both sides:
+  - **Fabric RowVersion** — `MAX(SYSROWVERSION)` from the Fabric table.
+  - **Fabric Last Modified** — `MAX(MODIFIEDDATETIME)` from the Fabric table when the column is present. If not, an estimate is provided and flagged with `(est.)`.
+  - **D365 RowVersion** — `MAX(SYSROWVERSION)` from D365, the database rowversion stamp of the last changed record. `0` means the table is empty or the column is unavailable.
+  - **D365 Last Modified** — `MAX(MODIFIEDDATETIME)` from D365 when the column is enabled. If not, an estimate is provided and flagged with `(est.)`.
+  - **Latency** — `D365 Last Modified − Fabric Last Modified`. How far behind the Fabric mirror is relative to the latest D365 change. Rendered as `3d 4h`, `45m 12s`, `0s` (current or ahead), or `N/A` when either timestamp is unavailable.
 - Generates a timestamped **HTML report** (sortable / filterable grid) and a matching **CSV** on every run.
 - Two Fabric counting modes:
   - **exact** (default) — runs `SELECT COUNT_BIG(*)` per table. Required for Fabric Warehouse (sys.partitions stats aren't tracked there).
@@ -24,10 +30,10 @@ The script POSTs to one of two operations on the same `FabricHelperService`:
 
 | Version | Operation | Backend | When to use |
 | ------- | --------- | ------- | ----------- |
-| **v1**  | `getTableRecordCount`   | Direct SQL `COUNT(*)` against the AxDB | Fastest. Use when you want the raw physical row count. |
-| **v2**  | `getTableRecordCountV2` | X++ `select count(RecId)` — same code path Fabric Link uses | Slower, but the result is **identical to what Fabric Link mirrors**, so it's the right comparison when validating Fabric ↔ F&O parity. |
+| **v1** ⭐ **default** | `getTableRecordCount`   | Direct SQL `COUNT(*)` against the AxDB | **Preferred** — fastest, no X++ overhead. Sufficient for normal reconciliation. |
+| **v2** (edge-case fallback) | `getTableRecordCountV2` | X++ `select count(RecId)` — same code path Fabric Link uses | Slower. Use only when V1 shows a persistent unexplained **Anomaly** and you need to rule out orphan-row noise (rows belonging to a removed `DataAreaId`). |
 
-Select the version with `D365_SERVICE_VERSION=v1` or `v2` in `.env` (default `v2`).
+Select the version with `D365_SERVICE_VERSION=v1` or `v2` in `.env` (default `v1`).
 
 URL format:
 ```
@@ -38,6 +44,7 @@ Body:
 ```json
 { "_request": { "TableName": "<NAME>", "RequestId": "<id>" } }
 ```
+> `FabricLastSysRowVersion` (optional `int64`) can be added to the request body when the Fabric table has no `MODIFIEDDATETIME` column. D365 uses it to resolve the modification time of the record last synced to Fabric.
 
 ## Table name mapping
 The D365 service expects F&O table names (e.g. `CUSTTABLE`). By default the script
@@ -71,11 +78,11 @@ python count_rows.py
 
 Sample output:
 ```
-Fabric Table     D365 Table  Fabric Rows  D365 Rows  Delta    Status
----------------  ----------  -----------  ---------  -------  -------
-dbo.bot          BOT                  40         40  0        Match
-dbo.systemuser   SYSTEMUSER          972      1,015  +43      Drift
-dbo.incident     INCIDENT              0          0  0        Match
+Fabric Table     D365 Table  Fabric Rows  Fabric RowVersion  Fabric Last Modified  D365 Rows  D365 RowVersion  D365 Last Modified    Latency    Delta  Status  Last SinkModifiedOn
+---------------  ----------  -----------  -----------------  --------------------  ---------  ---------------  --------------------  ---------  -----  ------  -------------------
+dbo.bot          BOT                  40         9876540001  2026-04-29 07:58:00          40       9876540000  2026-04-29 08:00:00   2m 0s          0  Match   2026-04-29 07:57:45
+dbo.systemuser   SYSTEMUSER          972         9876498000  2026-04-27 18:00:00       1,015       9876501234  2026-04-28 16:30:00   22h 30m      +43  Drift   2026-04-28 08:00:00
+dbo.incident     INCIDENT              0                  0  —                             0                0  —                     N/A            0  Match   —
 
 Summary: 2 Match, 1 Drift, 0 Anomaly, 0 Error (total 3 table(s))
 ```
@@ -84,8 +91,8 @@ Exit code is always `0` — Drift / Anomaly / N/A are reported as data, not fail
 
 ## Outputs
 On every run two timestamped files are written next to the script:
-- `report_YYYYMMDD_HHMMSS.html` — sortable / filterable grid with status badges and summary chips. Auto-opens in the default browser unless `HTML_OPEN=false`.
-- `report_YYYYMMDD_HHMMSS.csv` — same data, one row per table, suitable for Excel / further processing.
+- `report_YYYYMMDD_HHMMSS.html` — sortable / filterable grid with status badges and summary chips. Columns: **Fabric Table**, **D365 Table**, **Fabric Rows**, **Fabric RowVersion**, **Fabric Last Modified**, **D365 Rows**, **D365 RowVersion**, **D365 Last Modified** (each `(est.)` flagged when approximated), **Latency**, **Delta**, **Status**, **Last SinkModifiedOn**. Auto-opens in the default browser unless `HTML_OPEN=false`.
+- `report_YYYYMMDD_HHMMSS.csv` — same data, one row per table, with columns: `Fabric Table`, `D365 Table`, `Fabric Rows`, `Fabric RowVersion`, `Fabric Last Modified`, `Fabric Mod Estimated`, `D365 Rows`, `D365 RowVersion`, `D365 Last Modified`, `D365 Estimated`, `Latency`, `Delta`, `Status`, `Last SinkModifiedOn`. Suitable for Excel / further processing.
 
 Override the base names with `HTML_REPORT` and `CSV_REPORT` in `.env`. Leave either empty to skip that format.
 
@@ -94,3 +101,5 @@ Override the base names with `HTML_REPORT` and `CSV_REPORT` in `.env`. Leave eit
 - For unattended/CI use, switch `AUTH_MODE=serviceprincipal` and grant the SP access to the workspace.
 - For Lakehouse data, point at the Lakehouse's **SQL analytics endpoint** (read-only) — same code path.
 - For KQL databases or Power BI semantic models, this code won't apply — let me know and I'll add a variant.
+- Set `FABRIC_DEBUG=1` before running to write a diagnostic log (`fabric_debug.log`) listing which columns were detected per table.
+- Set `D365_DEBUG=1` to print the raw D365 JSON response for each table to the console (useful for troubleshooting service connectivity).

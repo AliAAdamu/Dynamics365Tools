@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import html
 import os
+import re
 import struct
 import sys
 import time
@@ -39,6 +40,7 @@ from dotenv import load_dotenv
 
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 FABRIC_SCOPE = "https://database.windows.net/.default"
+APP_VERSION = "1.1.0.1"
 
 
 @dataclass
@@ -75,6 +77,65 @@ def _parse_map(raw: str) -> dict[str, str]:
     return out
 
 
+_D365_MINVALUE_MS = -2208988800000  # DateTimeUtil::minValue() = 1900-01-01 00:00:00 UTC
+
+def _parse_d365_datetime(raw) -> str | None:
+    """Convert a D365 datetime value to 'YYYY-MM-DD HH:MM:SS'.
+
+    Handles both WCF /Date(ms)/ and ISO 8601 formats.
+    Returns None for null and 1900-01-01 (DateTimeUtil::minValue) sentinels.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # WCF /Date(ms)/ format
+    m = re.match(r"^/Date\((-?\d+)\)/", s)
+    if m:
+        ms = int(m.group(1))
+        if ms <= _D365_MINVALUE_MS:
+            return None
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    # ISO 8601 / SQL datetime string (e.g. "2026-04-29T08:08:42Z" or "2026-04-29 08:08:42")
+    s_clean = s.rstrip("Z").replace("T", " ")[:19]  # "YYYY-MM-DD HH:MM:SS"
+    if s_clean.startswith("1900-01-01") or s_clean.startswith("0001-01-01"):
+        return None
+    try:
+        datetime.strptime(s_clean, "%Y-%m-%d %H:%M:%S")  # validate
+        return s_clean
+    except ValueError:
+        return None
+
+
+def compute_latency(d365_mod: str | None, fabric_mod: str | None, fabric_synced_mod: str | None = None) -> str:
+    """Return a human-readable lag between D365's latest change and Fabric's last known state.
+
+    Uses fabric_mod (direct MODIFIEDDATETIME from Fabric) when available.
+    Falls back to fabric_synced_mod (D365's MODIFIEDDATETIME at Fabric's last SYSROWVERSION).
+    '0s' = Fabric current or ahead.  'N/A' = timestamps unavailable.
+    """
+    ref = fabric_mod or fabric_synced_mod
+    if not d365_mod or not ref:
+        return "N/A"
+    try:
+        fmt = "%Y-%m-%d %H:%M:%S"
+        t_d365 = datetime.strptime(d365_mod, fmt).replace(tzinfo=timezone.utc)
+        t_ref  = datetime.strptime(ref, fmt).replace(tzinfo=timezone.utc)
+        total  = int((t_d365 - t_ref).total_seconds())
+        if total <= 0:
+            return "0s"
+        days, rem    = divmod(total, 86400)
+        hours, rem   = divmod(rem, 3600)
+        minutes, sec = divmod(rem, 60)
+        if days:    return f"{days}d {hours}h"
+        if hours:   return f"{hours}h {minutes}m"
+        if minutes: return f"{minutes}m {sec}s"
+        return f"{sec}s"
+    except (ValueError, TypeError):
+        return "N/A"
+
+
 def load_config() -> Config:
     load_dotenv()
     raw_tables = os.getenv("FABRIC_TABLES", "").strip()
@@ -98,7 +159,7 @@ def load_config() -> Config:
         html_report=(os.getenv("HTML_REPORT") or "").strip() or None,
         html_open=os.getenv("HTML_OPEN", "true").lower() in ("1", "true", "yes"),
         csv_report=(os.getenv("CSV_REPORT") or "").strip() or None,
-        d365_service_version=os.getenv("D365_SERVICE_VERSION", "v2").strip().lower(),
+        d365_service_version=os.getenv("D365_SERVICE_VERSION", "v1").strip().lower(),
     )
 
 
@@ -150,10 +211,10 @@ def split_table(name: str) -> tuple[str, str]:
     return "dbo", name.strip("[] ")
 
 
-def count_fabric_fast(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[str, int, str | None]]:
+def count_fabric_fast(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[str, int, str | None, int | None, str | None]]:
     cur = conn.cursor()
     if tables:
-        results: list[tuple[str, int, str | None]] = []
+        results: list[tuple[str, int, str | None, int | None, str | None]] = []
         for t in tables:
             schema, tbl = split_table(t)
             cur.execute(
@@ -167,7 +228,7 @@ def count_fabric_fast(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[
                 schema, tbl,
             )
             row = cur.fetchone()
-            results.append((f"{schema}.{tbl}", int(row[0]) if row else 0, None))
+            results.append((f"{schema}.{tbl}", int(row[0]) if row else 0, None, None, None))
         return results
 
     cur.execute(
@@ -180,53 +241,74 @@ def count_fabric_fast(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[
         ORDER BY s.name, t.name
         """
     )
-    return [(r[0], int(r[1]) if r[1] is not None else 0, None) for r in cur.fetchall()]
+    return [(r[0], int(r[1]) if r[1] is not None else 0, None, None, None) for r in cur.fetchall()]
 
 
-def count_fabric_exact(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[str, int, str | None]]:
-    cur = conn.cursor()
+def count_fabric_exact(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[str, int, str | None, int | None, str | None]]:
+    cur      = conn.cursor()  # main cursor for SELECT COUNT / aggregate queries
+    cur_meta = conn.cursor()  # separate cursor for INFORMATION_SCHEMA detection
     if not tables:
-        cur.execute(
-            "SELECT s.name + '.' + t.name FROM sys.tables t "
-            "JOIN sys.schemas s ON t.schema_id = s.schema_id ORDER BY 1"
+        cur_meta.execute(
+            "SELECT table_schema + '.' + table_name FROM INFORMATION_SCHEMA.TABLES "
+            "WHERE table_type = 'BASE TABLE' ORDER BY 1"
         )
-        tables = [r[0] for r in cur.fetchall()]
+        tables = [r[0] for r in cur_meta.fetchall()]
 
-    # Discover which tables expose IsDelete / SinkModifiedOn columns
-    # (Dataverse / Fabric mirroring metadata).
-    cur.execute(
-        """
-        SELECT LOWER(s.name + '.' + t.name), c.name
-        FROM sys.columns c
-        JOIN sys.tables  t ON c.object_id = t.object_id
-        JOIN sys.schemas s ON t.schema_id  = s.schema_id
-        WHERE c.name IN ('IsDelete', 'SinkModifiedOn')
-        """
-    )
-    has_isdelete: set[str] = set()
-    has_sink: set[str] = set()
-    for full, col in cur.fetchall():
-        if col == "IsDelete":
-            has_isdelete.add(full)
-        elif col == "SinkModifiedOn":
-            has_sink.add(full)
+    _debug_fabric = os.getenv("FABRIC_DEBUG", "").lower() in ("1", "true", "yes")
 
-    results: list[tuple[str, int, str | None]] = []
+    def _dt(v) -> str | None:
+        if v is None:
+            return None
+        return v.strftime("%Y-%m-%d %H:%M:%S") if hasattr(v, "strftime") else (str(v) or None)
+
+    results: list[tuple[str, int, str | None, int | None, str | None]] = []
     for t in tables:
         schema, tbl = split_table(t)
         full = f"{schema}.{tbl}"
-        key = full.lower()
-        select = ["COUNT_BIG(*)"]
-        if key in has_sink:
-            select.append("MAX(SinkModifiedOn)")
-        where = " WHERE ISNULL(IsDelete, 0) = 0" if key in has_isdelete else ""
-        cur.execute(f"SELECT {', '.join(select)} FROM [{schema}].[{tbl}]{where}")
+        # Detect available columns via a targeted INFORMATION_SCHEMA.COLUMNS query
+        # using a DEDICATED cursor so it doesn't interfere with the main SELECT cursor.
+        t_col_map: dict[str, str] = {}
+        try:
+            cur_meta.execute(
+                "SELECT UPPER(column_name), column_name "
+                "FROM INFORMATION_SCHEMA.COLUMNS "
+                f"WHERE table_schema = '{schema}' AND table_name = '{tbl}' "
+                "AND UPPER(column_name) IN "
+                "('ISDELETE','SINKMODIFIEDON','SYSROWVERSION','MODIFIEDDATETIME')"
+            )
+            t_col_map = {row[0]: row[1] for row in cur_meta.fetchall()}
+        except Exception as _e:
+            if _debug_fabric:
+                print(f"[FABRIC_DEBUG] column detect failed for {full}: {_e}", flush=True)
+
+        col_sink     = f"MAX([{t_col_map['SINKMODIFIEDON']}])"   if "SINKMODIFIEDON"   in t_col_map else "NULL"
+        col_sysrv    = f"MAX([{t_col_map['SYSROWVERSION']}])"    if "SYSROWVERSION"    in t_col_map else "NULL"
+        col_moddt    = f"MAX([{t_col_map['MODIFIEDDATETIME']}])" if "MODIFIEDDATETIME" in t_col_map else "NULL"
+        isdelete_col = t_col_map.get("ISDELETE")
+        where        = f" WHERE ISNULL([{isdelete_col}], 0) = 0" if isdelete_col else ""
+        cur.execute(
+            f"SELECT COUNT_BIG(*), {col_sink}, {col_sysrv}, {col_moddt} "
+            f"FROM [{schema}].[{tbl}]{where}"
+        )
         row = cur.fetchone()
-        count = int(row[0])
-        sink = None
-        if key in has_sink and row[1] is not None:
-            sink = row[1].strftime("%Y-%m-%d %H:%M:%S") if hasattr(row[1], "strftime") else str(row[1])
-        results.append((full, count, sink))
+        # sysrowversion may come back as bytes (SQL rowversion type) — convert to int
+        raw_srv = row[2]
+        if isinstance(raw_srv, (bytes, bytearray)):
+            fabric_srv: int | None = int.from_bytes(raw_srv, "big")
+        elif raw_srv is not None:
+            try:
+                fabric_srv = int(raw_srv)
+            except (TypeError, ValueError):
+                fabric_srv = None
+        else:
+            fabric_srv = None
+        results.append((
+            full,
+            int(row[0]),
+            _dt(row[1]),
+            fabric_srv,
+            _dt(row[3]),
+        ))
     return results
 
 
@@ -257,12 +339,14 @@ def fabric_to_d365_name(fabric_name: str, mapping: dict[str, str]) -> str:
     return tbl.upper()
 
 
-def d365_count(session: requests.Session, base_uri: str, token: str, table_name: str, service_version: str = "v2") -> tuple[int | None, str | None, bool]:
-    """Returns (count, error_message, not_found).
+def d365_count(session: requests.Session, base_uri: str, token: str, table_name: str, service_version: str = "v2", *, fabric_srv: int | None = None, fabric_mod: str | None = None) -> tuple[int | None, str | None, bool, int | None, str | None, bool, str | None, bool]:
+    """Returns (count, error, not_found, last_sysrowversion, last_modified_dt, is_estimated, fabric_synced_mod, is_fabric_sync_est).
 
     service_version:
       - "v1": getTableRecordCount   (direct SQL query - faster)
       - "v2": getTableRecordCountV2 (X++ query - identical to Fabric Link)
+    fabric_mod: MAX(MODIFIEDDATETIME) from Fabric — when provided, D365 is not asked for a sync point.
+    fabric_srv: MAX(SYSROWVERSION) from Fabric — sent to D365 only when fabric_mod is None.
     """
     op = "getTableRecordCount" if service_version == "v1" else "getTableRecordCountV2"
     url = f"{base_uri}/api/services/FabricHelperServiceGroup/FabricHelperService/{op}"
@@ -272,13 +356,17 @@ def d365_count(session: requests.Session, base_uri: str, token: str, table_name:
         "Accept": "application/json",
     }
     body = {"_request": {"TableName": table_name, "RequestId": f"FRC-{uuid.uuid4().hex[:8]}"}}
+    # Pass Fabric rowversion to D365 only when Fabric lacks MODIFIEDDATETIME;
+    # D365 uses it to resolve the modification time at that sync point.
+    if fabric_mod is None and fabric_srv:
+        body["_request"]["FabricLastSysRowVersion"] = fabric_srv
 
     # Retry with exponential backoff on throttling (429) / transient 5xx.
     for attempt in range(5):
         try:
             r = session.post(url, json=body, headers=headers, timeout=60)
         except requests.RequestException as e:
-            return None, f"network: {e}", False
+            return None, f"network: {e}", False, None, None, False, None, False
         if r.status_code in (429, 502, 503, 504):
             wait = int(r.headers.get("Retry-After", "0")) or (2 ** attempt)
             time.sleep(min(wait, 30))
@@ -286,19 +374,28 @@ def d365_count(session: requests.Session, base_uri: str, token: str, table_name:
         break
 
     if r.status_code == 404:
-        return None, None, True
+        return None, None, True, None, None, False, None, False
     if r.status_code != 200:
-        return None, f"HTTP {r.status_code}: {r.text[:200]}", False
+        return None, f"HTTP {r.status_code}: {r.text[:200]}", False, None, None, False, None, False
     try:
         data = r.json()
     except ValueError:
-        return None, f"non-JSON response: {r.text[:200]}", False
+        return None, f"non-JSON response: {r.text[:200]}", False, None, None, False, None, False
+
+    if os.getenv("D365_DEBUG", "").lower() in ("1", "true", "yes"):
+        import json as _json
+        print(f"\n[D365_DEBUG] {table_name}: {_json.dumps(data, indent=2)[:4000]}", flush=True)
 
     if data.get("Success", False):
         rc = data.get("RecordCount")
         if rc is None:
-            return None, "no RecordCount in response", False
-        return int(rc), None, False
+            return None, "no RecordCount in response", False, None, None, False, None, False
+        last_srv = int(data.get("LastSysRowVersion") or 0)
+        last_mod = _parse_d365_datetime(data.get("LastModifiedDateTime"))
+        is_est = bool(data.get("IsEstimated", False))
+        fabric_synced_mod = _parse_d365_datetime(data.get("FabricSyncedModifiedDateTime"))
+        is_fabric_sync_est = bool(data.get("IsFabricSyncEstimated", False))
+        return int(rc), None, False, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est
 
     # Success=false. The service returns a generic "Error: " for both unknown tables
     # and other failures, and echoes back empty TableName/RequestId. Treat that
@@ -308,8 +405,8 @@ def d365_count(session: requests.Session, base_uri: str, token: str, table_name:
     not_found_markers = ("does not exist", "not found", "unknown table", "no such table", "invalid table")
     looks_generic = msg.lower().rstrip(":").strip() in ("error", "") and not echoed_table
     if looks_generic or any(m in msg.lower() for m in not_found_markers):
-        return None, None, True
-    return None, msg or "service returned Success=false", False
+        return None, None, True, None, None, False, None, False
+    return None, msg or "service returned Success=false", False, None, None, False, None, False
 
 
 # ---------------------------------------------------------------------------
@@ -349,15 +446,29 @@ def render_html_report(cfg: Config, rows, counts, out_path: str) -> str:
         return f'<td style="text-align:{align}">{html.escape(str(value))}</td>'
 
     body_rows = []
-    for fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink in rows:
+    for fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink, last_srv, last_mod, is_est, latency, fabric_srv, fabric_last_mod, is_fabric_mod_est in rows:
         fg, bg = STATUS_COLORS.get(status, ("#000", "#fff"))
-        d365_disp = f"{d365_count_val:,}" if d365_count_val is not None else "—"
+        fab_srv_disp    = "—" if fabric_srv is None else str(fabric_srv)
+        fab_mod_content = html.escape(fabric_last_mod) if fabric_last_mod else "—"
+        if is_fabric_mod_est and fabric_last_mod:
+            fab_mod_content += ' <em title="Estimated from correlated changes via SYSROWVERSION" style="color:#888;font-size:11px">(est.)</em>'
+        d365_disp    = f"{d365_count_val:,}" if d365_count_val is not None else "—"
+        srv_disp     = "—" if last_srv is None else str(last_srv)
+        mod_content  = html.escape(last_mod) if last_mod else "—"
+        if is_est and last_mod:
+            mod_content += ' <em title="Estimated from correlated changes via SYSROWVERSION" style="color:#888;font-size:11px">(est.)</em>'
+        lat_fg = "#a86200" if latency not in ("N/A", "0s", "—", "-") else "#5c5c5c"
         body_rows.append(
             "<tr>"
             + cell(fabric_name)
             + cell(d365_name)
             + cell(f"{fabric_count:,}", "right")
+            + cell(fab_srv_disp, "right")
+            + f'<td style="text-align:center;white-space:nowrap">{fab_mod_content}</td>'
             + cell(d365_disp, "right")
+            + cell(srv_disp, "right")
+            + f'<td style="text-align:center;white-space:nowrap">{mod_content}</td>'
+            + f'<td style="text-align:center;color:{lat_fg};font-weight:500">{html.escape(latency)}</td>'
             + cell(delta, "right")
             + f'<td style="text-align:center"><span class="badge" '
               f'style="background:{bg};color:{fg};border:1px solid {fg}33">'
@@ -410,10 +521,15 @@ def render_html_report(cfg: Config, rows, counts, out_path: str) -> str:
         <th onclick="sortTable(0)">Fabric Table</th>
         <th onclick="sortTable(1)">D365 Table</th>
         <th class="right" onclick="sortTable(2, true)">Fabric Rows</th>
-        <th class="right" onclick="sortTable(3, true)">D365 Rows</th>
-        <th class="right" onclick="sortTable(4, true)">Delta</th>
-        <th class="center" onclick="sortTable(5)">Status</th>
-        <th class="center" onclick="sortTable(6)">Last SinkModifiedOn</th>
+        <th class="right" onclick="sortTable(3, true)">Fabric RowVersion</th>
+        <th class="center" onclick="sortTable(4)">Fabric Last Modified</th>
+        <th class="right" onclick="sortTable(5, true)">D365 Rows</th>
+        <th class="right" onclick="sortTable(6, true)">D365 RowVersion</th>
+        <th class="center" onclick="sortTable(7)">D365 Last Modified</th>
+        <th class="center" onclick="sortTable(8)">Latency</th>
+        <th class="right" onclick="sortTable(9, true)">Delta</th>
+        <th class="center" onclick="sortTable(10)">Status</th>
+        <th class="center" onclick="sortTable(11)">Last SinkModifiedOn</th>
       </tr>
     </thead>
     <tbody>
@@ -474,7 +590,7 @@ def main() -> int:
         width = max((len(name) for name, *_ in fabric_rows), default=10)
         print(f"\n{'Table'.ljust(width)}  {'Fabric Rows':>15}  {'Last SinkModifiedOn':>20}")
         print(f"{'-' * width}  {'-' * 15}  {'-' * 20}")
-        for name, n, sink in fabric_rows:
+        for name, n, sink, *_ in fabric_rows:
             print(f"{name.ljust(width)}  {n:>15,}  {(sink or '-'):>20}")
         print(f"\n{len(fabric_rows)} table(s) reported.")
         return 0
@@ -483,26 +599,46 @@ def main() -> int:
     d365_token = get_d365_token(cfg)
     session = requests.Session()
 
-    rows: list[tuple[str, str, int, int | None, str, str, str | None]] = []
-    for fabric_name, fabric_count, sink in fabric_rows:
+    rows: list[tuple] = []
+    for fabric_name, fabric_count, sink, fabric_srv, fabric_mod in fabric_rows:
         d365_name = fabric_to_d365_name(fabric_name, cfg.table_name_map)
-        d365_count_val, err, not_found = d365_count(session, cfg.d365_uri, d365_token, d365_name, cfg.d365_service_version)
+        d365_count_val, err, not_found, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est = d365_count(
+            session, cfg.d365_uri, d365_token, d365_name, cfg.d365_service_version,
+            fabric_srv=fabric_srv, fabric_mod=fabric_mod,
+        )
         status, delta = classify(fabric_count, d365_count_val, not_found, err)
-        rows.append((fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink))
+        fabric_last_mod = fabric_mod or fabric_synced_mod
+        is_fabric_mod_est = fabric_mod is None and fabric_synced_mod is not None
+        latency = compute_latency(last_mod, fabric_mod, fabric_synced_mod)
+        rows.append((fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink,
+                     last_srv, last_mod, is_est, latency, fabric_srv, fabric_last_mod, is_fabric_mod_est))
 
     # Render table
-    headers = ("Fabric Table", "D365 Table", "Fabric Rows", "D365 Rows", "Delta", "Status", "Last SinkModifiedOn")
+    headers = ("Fabric Table", "D365 Table", "Fabric Rows", "Fabric RowVersion", "Fabric Last Modified",
+               "D365 Rows", "D365 RowVersion", "D365 Last Modified", "Latency", "Delta", "Status", "Last SinkModifiedOn")
     cols = list(zip(*([headers] + [
-        (n, d, f"{f:,}", f"{c:,}" if c is not None else "-", str(delta), status, sink or "-")
-        for n, d, f, c, delta, status, sink in rows
+        (n, d, f"{f:,}",
+         "-" if fab_srv is None else str(fab_srv),
+         (f"{fab_mod} (est.)" if fab_est else fab_mod) if fab_mod else "-",
+         f"{c:,}" if c is not None else "-",
+         "-" if srv is None else str(srv),
+         (f"{mod} (est.)" if is_est else mod) if mod else "-",
+         lat, str(delta), status, sink or "-")
+        for n, d, f, c, delta, status, sink, srv, mod, is_est, lat, fab_srv, fab_mod, fab_est in rows
     ])))
     widths = [max(len(str(v)) for v in col) for col in cols]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     print()
     print(fmt.format(*headers).rstrip())
     print(fmt.format(*["-" * w for w in widths]).rstrip())
-    for n, d, f, c, delta, status, sink in rows:
-        print(fmt.format(n, d, f"{f:,}", f"{c:,}" if c is not None else "-", str(delta), status, sink or "-").rstrip())
+    for n, d, f, c, delta, status, sink, srv, mod, is_est, lat, fab_srv, fab_mod, fab_est in rows:
+        mod_disp     = (f"{mod} (est.)" if is_est else mod) if mod else "-"
+        fab_mod_disp = (f"{fab_mod} (est.)" if fab_est else fab_mod) if fab_mod else "-"
+        print(fmt.format(n, d, f"{f:,}",
+                         "-" if fab_srv is None else str(fab_srv), fab_mod_disp,
+                         f"{c:,}" if c is not None else "-",
+                         "-" if srv is None else str(srv), mod_disp,
+                         lat, str(delta), status, sink or "-").rstrip())
 
     # Summary
     counts = {"Match": 0, "Drift": 0, "Anomaly": 0, "N/A": 0, "Error": 0}
@@ -545,12 +681,22 @@ def write_csv_report(rows, out_path: str) -> None:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["Fabric Table", "D365 Table", "Fabric Rows", "D365 Rows", "Delta", "Status", "Last SinkModifiedOn"])
-        for fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink in rows:
+        w.writerow(["Fabric Table", "D365 Table",
+                    "Fabric Rows", "Fabric RowVersion", "Fabric Last Modified", "Fabric Mod Estimated",
+                    "D365 Rows", "D365 RowVersion", "D365 Last Modified", "D365 Estimated",
+                    "Latency", "Delta", "Status", "Last SinkModifiedOn"])
+        for fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink, last_srv, last_mod, is_est, latency, fabric_srv, fabric_last_mod, is_fabric_mod_est in rows:
             w.writerow([
-                fabric_name, d365_name, fabric_count,
+                fabric_name, d365_name,
+                fabric_count,
+                fabric_srv if fabric_srv is not None else "",
+                fabric_last_mod or "",
+                "Yes" if is_fabric_mod_est else "No",
                 d365_count_val if d365_count_val is not None else "",
-                delta, status, sink or "",
+                last_srv if last_srv is not None else "",
+                last_mod or "",
+                "Yes" if is_est else "No",
+                latency, delta, status, sink or "",
             ])
 
 
