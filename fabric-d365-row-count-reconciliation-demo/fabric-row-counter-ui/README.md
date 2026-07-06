@@ -4,7 +4,7 @@ A small web app that wraps the original `fabric-row-counter` CLI in a
 user-friendly form. No code from the CLI is duplicated — `count_rows.py`
 in `..\fabric-row-counter` is imported as a library, so any improvement
 to the CLI is automatically picked up here.
-
+The UI title is **Fabric ↔ Dynamics 365 FinOps Reconciliation Tool**.
 ## Features
 - Form-based connection settings (Fabric endpoint, database, D365 URI, auth, etc.)
 - Choose D365 service version (**v1** Direct SQL or **v2** X++ / Fabric Link)

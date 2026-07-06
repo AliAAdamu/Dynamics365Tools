@@ -46,7 +46,7 @@ STATUS_COLORS = {
 }
 
 st.set_page_config(page_title="Fabric Row Counter", page_icon="📊", layout="wide")
-st.title("📊 Fabric ↔ Dynamics 365 Row Counter")
+st.title("📊 Fabric ↔ Dynamics 365 FinOps Reconciliation Tool")
 _ver = getattr(cr, "APP_VERSION", "legacy")
 st.caption(f"Compare Fabric Warehouse row counts to the source D365 F&O environment. &nbsp; `v{_ver}`")
 
@@ -142,7 +142,7 @@ def run_comparison(cfg: cr.Config):
     status_box = st.empty()
 
     with cr.connect_fabric(cfg) as conn:
-        progress.progress(0.1, text="Counting rows in Fabric…")
+        progress.progress(0.1, text="Retrieving info from Fabric…")
         if cfg.count_mode == "exact":
             fabric_rows = cr.count_fabric_exact(conn, cfg.tables)
         else:
