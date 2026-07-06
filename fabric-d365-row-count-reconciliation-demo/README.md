@@ -1,4 +1,4 @@
-# Fabric ↔ Dynamics 365 Row Count Demo
+# Fabric ↔ Dynamics 365 Row Count & Latency Demo
 
 > ⚠️ **This is a demonstration / sample.** It is intentionally small, opinionated,
 > and not production-ready. Customers and partners are **expected to adopt,
@@ -11,6 +11,12 @@ warehouse (typically the destination of a **Fabric Link** mirroring) and the
 **Dynamics 365 Finance & Operations** source environment, then highlights any
 **Match / Drift / Anomaly** so you can quickly spot where the mirrored data
 diverges from the source.
+
+In addition to row counts, the tool calculates **replication latency** —
+estimated per table — by comparing the last-modified timestamp of the most
+recently synced record in Fabric against the current time in D365 F&O. This
+gives you an at-a-glance measure of **how far behind Fabric is** for each
+table, even when an exact end-to-end latency cannot be directly observed.
 
 ## 🎬 Demo
 
