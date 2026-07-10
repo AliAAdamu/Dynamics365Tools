@@ -40,12 +40,14 @@ from dotenv import load_dotenv
 
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 FABRIC_SCOPE = "https://database.windows.net/.default"
-APP_VERSION = "1.1.0.1"
+APP_VERSION = "1.1.0.2"
 
 
 @dataclass
 class Config:
-    # Fabric
+    # Source selection
+    source_type: str  # "fabric" | "synapse"
+    # Fabric Link
     endpoint: str
     database: str
     tables: list[str]
@@ -54,6 +56,13 @@ class Config:
     client_id: str | None
     client_secret: str | None
     count_mode: str
+    # Synapse Link (SQL Serverless)
+    synapse_endpoint: str | None
+    synapse_database: str | None
+    synapse_auth_mode: str
+    synapse_tenant_id: str | None
+    synapse_client_id: str | None
+    synapse_client_secret: str | None
     # D365
     d365_uri: str | None
     d365_auth_mode: str
@@ -108,14 +117,29 @@ def _parse_d365_datetime(raw) -> str | None:
         return None
 
 
-def compute_latency(d365_mod: str | None, fabric_mod: str | None, fabric_synced_mod: str | None = None) -> str:
-    """Return a human-readable lag between D365's latest change and Fabric's last known state.
+def compute_latency(d365_mod: str | None, fabric_mod: str | None, fabric_synced_mod: str | None = None, sink_mod: str | None = None) -> str:
+    """Return a human-readable lag between D365’s latest change and Fabric’s last known state.
 
-    Uses fabric_mod (direct MODIFIEDDATETIME from Fabric) when available.
-    Falls back to fabric_synced_mod (D365's MODIFIEDDATETIME at Fabric's last SYSROWVERSION).
-    '0s' = Fabric current or ahead.  'N/A' = timestamps unavailable.
+    Reference priority for the Fabric side:
+    1. fabric_mod  (MAX(MODIFIEDDATETIME) from Fabric)
+    2. If sink_mod > fabric_mod AND sink_mod < d365_mod, use sink_mod instead —
+       SinkModifiedOn is a more recent ingestion marker in that case.
+    3. Falls back to fabric_synced_mod (estimated from D365 SYSROWVERSION).
+    ‘0s’ = Fabric current or ahead.  ‘N/A’ = timestamps unavailable.
     """
     ref = fabric_mod or fabric_synced_mod
+    # Override with SinkModifiedOn when it is a better “how current is Fabric” proxy:
+    # i.e. more recent than MODIFIEDDATETIME but still behind D365’s latest change.
+    if sink_mod and fabric_mod and d365_mod:
+        try:
+            fmt = "%Y-%m-%d %H:%M:%S"
+            t_sink = datetime.strptime(sink_mod, fmt).replace(tzinfo=timezone.utc)
+            t_fab  = datetime.strptime(fabric_mod, fmt).replace(tzinfo=timezone.utc)
+            t_d365 = datetime.strptime(d365_mod, fmt).replace(tzinfo=timezone.utc)
+            if t_sink > t_fab and t_sink < t_d365:
+                ref = sink_mod
+        except (ValueError, TypeError):
+            pass
     if not d365_mod or not ref:
         return "N/A"
     try:
@@ -140,15 +164,27 @@ def load_config() -> Config:
     load_dotenv()
     raw_tables = os.getenv("FABRIC_TABLES", "").strip()
     tables = [t.strip() for t in raw_tables.split(",") if t.strip()]
+    source = os.getenv("SOURCE_TYPE", "fabric").lower()
+    if source == "fabric" and not os.getenv("FABRIC_SQL_ENDPOINT"):
+        raise SystemExit("FABRIC_SQL_ENDPOINT is required when SOURCE_TYPE=fabric (or is unset).")
+    if source == "synapse" and not os.getenv("SYNAPSE_SQL_ENDPOINT"):
+        raise SystemExit("SYNAPSE_SQL_ENDPOINT is required when SOURCE_TYPE=synapse.")
     return Config(
-        endpoint=os.environ["FABRIC_SQL_ENDPOINT"],
-        database=os.environ["FABRIC_DATABASE"],
+        source_type=source,
+        endpoint=(os.getenv("FABRIC_SQL_ENDPOINT") or "").strip(),
+        database=(os.getenv("FABRIC_DATABASE") or "").strip(),
         tables=tables,
         auth_mode=os.getenv("AUTH_MODE", "interactive").lower(),
         tenant_id=os.getenv("AZURE_TENANT_ID"),
         client_id=os.getenv("AZURE_CLIENT_ID"),
         client_secret=os.getenv("AZURE_CLIENT_SECRET"),
         count_mode=os.getenv("COUNT_MODE", "exact").lower(),
+        synapse_endpoint=(os.getenv("SYNAPSE_SQL_ENDPOINT") or "").strip() or None,
+        synapse_database=(os.getenv("SYNAPSE_DATABASE") or "").strip() or None,
+        synapse_auth_mode=os.getenv("SYNAPSE_AUTH_MODE", "interactive").lower(),
+        synapse_tenant_id=os.getenv("SYNAPSE_TENANT_ID"),
+        synapse_client_id=os.getenv("SYNAPSE_CLIENT_ID"),
+        synapse_client_secret=os.getenv("SYNAPSE_CLIENT_SECRET"),
         d365_uri=(os.getenv("D365_URI") or "").rstrip("/") or None,
         d365_auth_mode=os.getenv("D365_AUTH_MODE", "interactive").lower(),
         d365_tenant_id=os.getenv("D365_TENANT_ID"),
@@ -204,6 +240,49 @@ def connect_fabric(cfg: Config) -> pyodbc.Connection:
     return pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
 
 
+def get_synapse_token(cfg: Config) -> str:
+    """Obtain an Azure AD bearer token for Synapse Link SQL Serverless (same scope as Fabric)."""
+    if cfg.synapse_auth_mode == "serviceprincipal":
+        if not (cfg.synapse_tenant_id and cfg.synapse_client_id and cfg.synapse_client_secret):
+            raise SystemExit(
+                "Synapse service principal auth requires SYNAPSE_TENANT_ID, "
+                "SYNAPSE_CLIENT_ID, SYNAPSE_CLIENT_SECRET."
+            )
+        cred = ClientSecretCredential(cfg.synapse_tenant_id, cfg.synapse_client_id, cfg.synapse_client_secret)
+    elif cfg.synapse_auth_mode == "cli":
+        cred = AzureCliCredential()
+    else:
+        cred = InteractiveBrowserCredential()
+    return cred.get_token(FABRIC_SCOPE).token  # https://database.windows.net/.default
+
+
+def connect_synapse(cfg: Config) -> pyodbc.Connection:
+    """Connect to a Synapse Link SQL Serverless endpoint using Azure AD token auth.
+
+    The serverless endpoint format is:
+        <workspace>-ondemand.sql.azuresynapse.net
+
+    Note: sys.partitions metadata is not available on SQL Serverless — only
+    COUNT_BIG(*) (exact mode) is supported.
+    """
+    if not cfg.synapse_endpoint or not cfg.synapse_database:
+        raise SystemExit(
+            "SYNAPSE_SQL_ENDPOINT and SYNAPSE_DATABASE are required when SOURCE_TYPE=synapse.\n"
+            "The endpoint looks like: <workspace>-ondemand.sql.azuresynapse.net"
+        )
+    token = get_synapse_token(cfg)
+    token_bytes = token.encode("utf-16-le")
+    token_struct = struct.pack(f"=i{len(token_bytes)}s", len(token_bytes), token_bytes)
+    driver = pick_driver()
+    conn_str = (
+        f"Driver={{{driver}}};"
+        f"Server={cfg.synapse_endpoint},1433;"
+        f"Database={cfg.synapse_database};"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+    )
+    return pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
+
+
 def split_table(name: str) -> tuple[str, str]:
     if "." in name:
         schema, tbl = name.split(".", 1)
@@ -254,8 +333,6 @@ def count_fabric_exact(conn: pyodbc.Connection, tables: list[str]) -> list[tuple
         )
         tables = [r[0] for r in cur_meta.fetchall()]
 
-    _debug_fabric = os.getenv("FABRIC_DEBUG", "").lower() in ("1", "true", "yes")
-
     def _dt(v) -> str | None:
         if v is None:
             return None
@@ -277,38 +354,45 @@ def count_fabric_exact(conn: pyodbc.Connection, tables: list[str]) -> list[tuple
                 "('ISDELETE','SINKMODIFIEDON','SYSROWVERSION','MODIFIEDDATETIME')"
             )
             t_col_map = {row[0]: row[1] for row in cur_meta.fetchall()}
-        except Exception as _e:
-            if _debug_fabric:
-                print(f"[FABRIC_DEBUG] column detect failed for {full}: {_e}", flush=True)
+        except Exception:
+            pass
 
         col_sink     = f"MAX([{t_col_map['SINKMODIFIEDON']}])"   if "SINKMODIFIEDON"   in t_col_map else "NULL"
         col_sysrv    = f"MAX([{t_col_map['SYSROWVERSION']}])"    if "SYSROWVERSION"    in t_col_map else "NULL"
         col_moddt    = f"MAX([{t_col_map['MODIFIEDDATETIME']}])" if "MODIFIEDDATETIME" in t_col_map else "NULL"
         isdelete_col = t_col_map.get("ISDELETE")
         where        = f" WHERE ISNULL([{isdelete_col}], 0) = 0" if isdelete_col else ""
-        cur.execute(
-            f"SELECT COUNT_BIG(*), {col_sink}, {col_sysrv}, {col_moddt} "
-            f"FROM [{schema}].[{tbl}]{where}"
-        )
-        row = cur.fetchone()
-        # sysrowversion may come back as bytes (SQL rowversion type) — convert to int
-        raw_srv = row[2]
-        if isinstance(raw_srv, (bytes, bytearray)):
-            fabric_srv: int | None = int.from_bytes(raw_srv, "big")
-        elif raw_srv is not None:
-            try:
-                fabric_srv = int(raw_srv)
-            except (TypeError, ValueError):
+        try:
+            cur.execute(
+                f"SELECT COUNT_BIG(*), {col_sink}, {col_sysrv}, {col_moddt} "
+                f"FROM [{schema}].[{tbl}]{where}"
+            )
+            row = cur.fetchone()
+            # sysrowversion may come back as bytes (SQL rowversion type) — convert to int
+            raw_srv = row[2]
+            if isinstance(raw_srv, (bytes, bytearray)):
+                fabric_srv: int | None = int.from_bytes(raw_srv, "big")
+            elif raw_srv is not None:
+                try:
+                    fabric_srv = int(raw_srv)
+                except (TypeError, ValueError):
+                    fabric_srv = None
+            else:
                 fabric_srv = None
-        else:
-            fabric_srv = None
-        results.append((
-            full,
-            int(row[0]),
-            _dt(row[1]),
-            fabric_srv,
-            _dt(row[3]),
-        ))
+            results.append((
+                full,
+                int(row[0]),
+                _dt(row[1]),
+                fabric_srv,
+                _dt(row[3]),
+            ))
+        except Exception as _count_err:
+            # Table metadata exists but underlying storage is unavailable
+            # (e.g. OneLake Parquet file missing, Fabric Link sync in progress).
+            # Record None so this table shows as Error without aborting the run.
+            import sys as _sys
+            print(f"[WARN] Count query failed for {full}: {_count_err}", file=_sys.stderr, flush=True)
+            results.append((full, None, None, None, None))
     return results
 
 
@@ -382,10 +466,6 @@ def d365_count(session: requests.Session, base_uri: str, token: str, table_name:
     except ValueError:
         return None, f"non-JSON response: {r.text[:200]}", False, None, None, False, None, False
 
-    if os.getenv("D365_DEBUG", "").lower() in ("1", "true", "yes"):
-        import json as _json
-        print(f"\n[D365_DEBUG] {table_name}: {_json.dumps(data, indent=2)[:4000]}", flush=True)
-
     if data.get("Success", False):
         rc = data.get("RecordCount")
         if rc is None:
@@ -438,9 +518,11 @@ STATUS_COLORS = {
 }
 
 
-def render_html_report(cfg: Config, rows, counts, out_path: str) -> str:
+def render_html_report(cfg: Config, rows, counts, out_path: str, source_label: str = "Fabric") -> str:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     total = len(rows)
+    src_endpoint = (cfg.synapse_endpoint or "") if cfg.source_type == "synapse" else cfg.endpoint
+    src_database = (cfg.synapse_database or "") if cfg.source_type == "synapse" else cfg.database
 
     def cell(value, align="left"):
         return f'<td style="text-align:{align}">{html.escape(str(value))}</td>'
@@ -487,7 +569,7 @@ def render_html_report(cfg: Config, rows, counts, out_path: str) -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Fabric vs D365 Row Count Report</title>
+  <title>{source_label} vs D365 Row Count Report</title>
   <style>
     :root {{ font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color:#222; }}
     body {{ margin: 24px; background: #fafafa; }}
@@ -507,10 +589,10 @@ def render_html_report(cfg: Config, rows, counts, out_path: str) -> str:
   </style>
 </head>
 <body>
-  <h1>Fabric vs Dynamics 365 Row Count Comparison</h1>
+  <h1>{source_label} vs Dynamics 365 Row Count Comparison</h1>
   <div class="meta">
     Generated <b>{generated}</b><br>
-    Fabric: <code>{html.escape(cfg.endpoint)}</code> / <code>{html.escape(cfg.database)}</code><br>
+    {source_label}: <code>{html.escape(src_endpoint)}</code> / <code>{html.escape(src_database)}</code><br>
     D365: <code>{html.escape(cfg.d365_uri or '')}</code> &nbsp; Tables: <b>{total}</b>
   </div>
   <div class="summary">{summary_chips}</div>
@@ -518,15 +600,15 @@ def render_html_report(cfg: Config, rows, counts, out_path: str) -> str:
   <table id="grid">
     <thead>
       <tr>
-        <th onclick="sortTable(0)">Fabric Table</th>
+        <th onclick="sortTable(0)">{source_label} Table</th>
         <th onclick="sortTable(1)">D365 Table</th>
-        <th class="right" onclick="sortTable(2, true)">Fabric Rows</th>
-        <th class="right" onclick="sortTable(3, true)">Fabric RowVersion</th>
-        <th class="center" onclick="sortTable(4)">Fabric Last Modified</th>
+        <th class="right" onclick="sortTable(2, true)">{source_label} Rows</th>
+        <th class="right" onclick="sortTable(3, true)">{source_label} RowVersion</th>
+        <th class="center" onclick="sortTable(4)">{source_label} Last Modified</th>
         <th class="right" onclick="sortTable(5, true)">D365 Rows</th>
         <th class="right" onclick="sortTable(6, true)">D365 RowVersion</th>
         <th class="center" onclick="sortTable(7)">D365 Last Modified</th>
-        <th class="center" onclick="sortTable(8)">Latency</th>
+        <th class="center" onclick="sortTable(8)">Running Latency</th>
         <th class="right" onclick="sortTable(9, true)">Delta</th>
         <th class="center" onclick="sortTable(10)">Status</th>
         <th class="center" onclick="sortTable(11)">Last SinkModifiedOn</th>
@@ -575,11 +657,20 @@ def render_html_report(cfg: Config, rows, counts, out_path: str) -> str:
 
 def main() -> int:
     cfg = load_config()
-    print(f"Connecting to Fabric {cfg.endpoint} / {cfg.database} "
-          f"(auth={cfg.auth_mode}, mode={cfg.count_mode})")
+    is_synapse = cfg.source_type == "synapse"
+    source_label = "Synapse" if is_synapse else "Fabric"
+    src_endpoint = cfg.synapse_endpoint if is_synapse else cfg.endpoint
+    src_database = cfg.synapse_database if is_synapse else cfg.database
+    src_auth = cfg.synapse_auth_mode if is_synapse else cfg.auth_mode
+    effective_mode = "exact (forced — SQL Serverless)" if is_synapse else cfg.count_mode
 
-    with connect_fabric(cfg) as conn:
-        if cfg.count_mode == "exact":
+    print(f"Connecting to {source_label} {src_endpoint} / {src_database} "
+          f"(auth={src_auth}, mode={effective_mode})")
+
+    connect_fn = connect_synapse if is_synapse else connect_fabric
+    with connect_fn(cfg) as conn:
+        # Synapse SQL Serverless does not expose sys.partitions; always use exact mode.
+        if cfg.count_mode == "exact" or is_synapse:
             fabric_rows = count_fabric_exact(conn, cfg.tables)
         else:
             fabric_rows = count_fabric_fast(conn, cfg.tables)
@@ -588,10 +679,11 @@ def main() -> int:
         if not cfg.skip_d365:
             print("\n[D365_URI not set - skipping D365 comparison]")
         width = max((len(name) for name, *_ in fabric_rows), default=10)
-        print(f"\n{'Table'.ljust(width)}  {'Fabric Rows':>15}  {'Last SinkModifiedOn':>20}")
+        print(f"\n{'Table'.ljust(width)}  {f'{source_label} Rows':>15}  {'Last SinkModifiedOn':>20}")
         print(f"{'-' * width}  {'-' * 15}  {'-' * 20}")
         for name, n, sink, *_ in fabric_rows:
-            print(f"{name.ljust(width)}  {n:>15,}  {(sink or '-'):>20}")
+            n_disp = f"{n:,}" if n is not None else "Error"
+            print(f"{name.ljust(width)}  {n_disp:>15}  {(sink or '-'):>20}")
         print(f"\n{len(fabric_rows)} table(s) reported.")
         return 0
 
@@ -609,15 +701,15 @@ def main() -> int:
         status, delta = classify(fabric_count, d365_count_val, not_found, err)
         fabric_last_mod = fabric_mod or fabric_synced_mod
         is_fabric_mod_est = fabric_mod is None and fabric_synced_mod is not None
-        latency = compute_latency(last_mod, fabric_mod, fabric_synced_mod)
+        latency = compute_latency(last_mod, fabric_mod, fabric_synced_mod, sink)
         rows.append((fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink,
                      last_srv, last_mod, is_est, latency, fabric_srv, fabric_last_mod, is_fabric_mod_est))
 
     # Render table
-    headers = ("Fabric Table", "D365 Table", "Fabric Rows", "Fabric RowVersion", "Fabric Last Modified",
-               "D365 Rows", "D365 RowVersion", "D365 Last Modified", "Latency", "Delta", "Status", "Last SinkModifiedOn")
+    headers = (f"{source_label} Table", "D365 Table", f"{source_label} Rows", f"{source_label} RowVersion", f"{source_label} Last Modified",
+               "D365 Rows", "D365 RowVersion", "D365 Last Modified", "Running Latency", "Delta", "Status", "Last SinkModifiedOn")
     cols = list(zip(*([headers] + [
-        (n, d, f"{f:,}",
+        (n, d, f"{f:,}" if f is not None else "Error",
          "-" if fab_srv is None else str(fab_srv),
          (f"{fab_mod} (est.)" if fab_est else fab_mod) if fab_mod else "-",
          f"{c:,}" if c is not None else "-",
@@ -634,7 +726,7 @@ def main() -> int:
     for n, d, f, c, delta, status, sink, srv, mod, is_est, lat, fab_srv, fab_mod, fab_est in rows:
         mod_disp     = (f"{mod} (est.)" if is_est else mod) if mod else "-"
         fab_mod_disp = (f"{fab_mod} (est.)" if fab_est else fab_mod) if fab_mod else "-"
-        print(fmt.format(n, d, f"{f:,}",
+        print(fmt.format(n, d, f"{f:,}" if f is not None else "Error",
                          "-" if fab_srv is None else str(fab_srv), fab_mod_disp,
                          f"{c:,}" if c is not None else "-",
                          "-" if srv is None else str(srv), mod_disp,
@@ -655,7 +747,7 @@ def main() -> int:
     # HTML report
     if cfg.html_report:
         html_path = timestamped_path(cfg.html_report, ts)
-        path = render_html_report(cfg, rows, counts, html_path)
+        path = render_html_report(cfg, rows, counts, html_path, source_label)
         print(f"\nHTML report written: {path}")
         if cfg.html_open:
             try:
@@ -684,7 +776,7 @@ def write_csv_report(rows, out_path: str) -> None:
         w.writerow(["Fabric Table", "D365 Table",
                     "Fabric Rows", "Fabric RowVersion", "Fabric Last Modified", "Fabric Mod Estimated",
                     "D365 Rows", "D365 RowVersion", "D365 Last Modified", "D365 Estimated",
-                    "Latency", "Delta", "Status", "Last SinkModifiedOn"])
+                    "Running Latency", "Delta", "Status", "Last SinkModifiedOn"])
         for fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink, last_srv, last_mod, is_est, latency, fabric_srv, fabric_last_mod, is_fabric_mod_est in rows:
             w.writerow([
                 fabric_name, d365_name,

@@ -1,4 +1,4 @@
-# Fabric ↔ Dynamics 365 Row Count & Latency Demo
+# Fabric Link / Synapse Link ↔ Dynamics 365 Row Count & Latency Demo
 
 > ⚠️ **This is a demonstration / sample.** It is intentionally small, opinionated,
 > and not production-ready. Customers and partners are **expected to adopt,
@@ -6,16 +6,18 @@
 > branding, etc.) to fit their environment and policies. The author and
 > Microsoft provide no warranty and no support — see the [Disclaimer](#disclaimer).
 
-A small toolkit that compares **row counts** between a Microsoft Fabric
-warehouse (typically the destination of a **Fabric Link** mirroring) and the
-**Dynamics 365 Finance & Operations** source environment, then highlights any
-**Match / Drift / Anomaly** so you can quickly spot where the mirrored data
-diverges from the source.
+A small toolkit that compares **row counts** between the analytical data copy
+— either a **Fabric Link** destination (Microsoft Fabric Warehouse / Lakehouse)
+or a **Synapse Link** destination (Azure Synapse Analytics SQL Serverless endpoint)
+— and the **Dynamics 365 Finance & Operations** source environment, then highlights
+any **Match / Drift / Anomaly** so you can quickly spot where the mirrored data
+diverges from the source. Customers who have only Fabric Link, only Synapse Link,
+or both, are all supported.
 
 In addition to row counts, the tool calculates **replication latency** —
 estimated per table — by comparing the last-modified timestamp of the most
-recently synced record in Fabric against the current time in D365 F&O. This
-gives you an at-a-glance measure of **how far behind Fabric is** for each
+recently synced record in the analytical copy against the current time in D365 F&O.
+This gives you an at-a-glance measure of **how far behind the mirror is** for each
 table, even when an exact end-to-end latency cannot be directly observed.
 
 ## 🎬 Demo
@@ -27,7 +29,7 @@ file is at [`docs/Fabric-Dynamics365FO-RowCounterSmall.mp4`](docs/demo.webm).</s
 
 <video src="docs/Fabric-Dynamics365FO-RowCounterSmall.mp4" controls width="720"></video>
 
-### Current UI (v1.1.0.1)
+### Current UI (v1.1.0.2)
 
 ![Fabric ↔ D365 Row Counter UI showing Fabric RowVersion, Fabric Last Modified, D365 RowVersion, D365 Last Modified and Latency columns](docs/ui-v1.1.0.1.png)
 
@@ -206,7 +208,7 @@ For automation / CI.
 cd fabric-row-counter
 .\install.ps1
 Copy-Item .env.example .env
-notepad .env       # fill in Fabric endpoint, database, D365 URI, etc.
+notepad .env       # fill in SOURCE_TYPE, Fabric or Synapse endpoint/database, D365 URI, etc.
 .\.venv\Scripts\python.exe count_rows.py
 ```
 
@@ -218,13 +220,14 @@ full list of environment variables (auth modes, table filters,
 
 ## Prerequisites (all options)
 
-- A **Fabric Warehouse** that mirrors data from D365 F&O via **Fabric Link**
-  (or any equivalent path). You'll need its **SQL connection string** and the
-  warehouse / database name.
+- An analytical data copy of your D365 F&O tables via one of:
+  - **Fabric Link** — a Fabric Warehouse or Lakehouse. You'll need its **SQL connection string** and database name.
+  - **Synapse Link** — an Azure Synapse Analytics workspace with a SQL Serverless endpoint (`<workspace>-ondemand.sql.azuresynapse.net`) and a lake database. You'll need the endpoint and database name.
+  - **Both** — the UI lets you run and compare both sources side by side in one session.
 - A **D365 F&O environment** with the `FabricHelperService` deployed
   (see Step 1).
 - Azure AD identity (interactive user **or** service principal) with read
-  access to both the Fabric warehouse and the D365 service.
+  access to the Fabric / Synapse endpoint and the D365 service.
 - **ODBC Driver 18 for SQL Server** on the machine running the tool.
 - For Options B & C only: **Python 3.10+**.
 
