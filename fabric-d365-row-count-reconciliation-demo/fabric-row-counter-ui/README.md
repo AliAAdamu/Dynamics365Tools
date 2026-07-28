@@ -13,7 +13,7 @@ run time.
 - **Data source selector** — choose **Fabric Link**, **Synapse Link**, or **Both** from the sidebar radio button. When *Both* is selected results appear in two tabs, one per source.
 - Form-based connection settings for each source (SQL endpoint, database, auth, etc.)
 - D365 connection settings (URI, auth, service version)
-- Choose D365 service version (**v1** Direct SQL or **v2** X++ / Fabric Link)
+- Choose D365 service version (**v3** bulk catalog-based counts — fastest, default; **v1** Direct SQL; or **v2** X++ / Fabric Link)
 - Live progress bar while counting tables
 - Sortable / filterable results grid showing all comparison columns:
   - **Source Rows** / **D365 Rows** — raw counts from each side (column header shows *Fabric* or *Synapse* based on the selected source)
@@ -46,6 +46,13 @@ http://localhost:8501. Fill in the sidebar, click **Run comparison**.
 ## Notes
 - The first run authenticates twice via browser popup (Fabric or Synapse, then D365).
   Subsequent runs in the same session reuse the cached token.
+- **Use same sign-in for Fabric/Synapse and D365** (checked by default, in the
+  *Dynamics 365 F&O* expander) — when checked, both auth requests reuse the
+  same cached interactive credential, so they must be the same account.
+  Uncheck it if the Fabric/Synapse SQL endpoint and the D365 environment
+  need **different user accounts**: D365 then gets its own
+  `InteractiveBrowserCredential` and its own sign-in prompt. Env var
+  equivalent: `SAME_CREDENTIALS` (`true`/`false`).
 - For unattended/CI use, switch the auth mode to **serviceprincipal** and
   fill in the **Service principal** expander. Synapse Link can share the
   same SP credentials or use its own (separate fields appear when Synapse
@@ -56,3 +63,7 @@ http://localhost:8501. Fill in the sidebar, click **Run comparison**.
 - **Synapse SQL Serverless** only supports `exact` count mode (`COUNT_BIG(*)`)
   — `sys.partitions` metadata is not available on serverless endpoints.
   The UI enforces this automatically.
+
+## Security
+- Interactive auth (`InteractiveBrowserCredential`) is cached **per process, in memory only** — never written to disk — so a single run needs at most one browser sign-in instead of a new popup per token request.
+- Intended for **single-user, local (`localhost`) use**. If you ever host this for multiple concurrent users, scope the credential cache to `st.session_state` instead of the shared module-level cache to keep sessions isolated.

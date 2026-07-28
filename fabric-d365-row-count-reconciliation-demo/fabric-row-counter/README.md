@@ -25,26 +25,31 @@ Small Python CLI that connects to a Microsoft Fabric **Warehouse**, **Lakehouse 
   - **exact** (default) — runs `SELECT COUNT_BIG(*)` per table. Required for Fabric Warehouse and **mandatory** for Synapse SQL Serverless (`sys.partitions` is not available on serverless endpoints).
   - **fast** — reads `sys.partitions` metadata. Instant on classic SQL Server / Azure SQL DB, but returns 0 on Fabric Warehouse and **must not be used** with Synapse SQL Serverless.
 
-## D365 endpoint — V1 vs V2
-The script POSTs to one of two operations on the same `FabricHelperService`:
+## D365 endpoint — V1 vs V2 vs V3
+The script POSTs to operations on the same `FabricHelperService`:
 
-| Version | Operation | Backend | When to use |
+| Version | Operation(s) | Backend | When to use |
 | ------- | --------- | ------- | ----------- |
-| **v1** ⭐ **default** | `getTableRecordCount`   | Direct SQL `COUNT(*)` against the AxDB | **Preferred** — fastest, no X++ overhead. Sufficient for normal reconciliation. |
-| **v2** (edge-case fallback) | `getTableRecordCountV2` | X++ `select count(RecId)` — same code path Fabric Link uses | Slower. Use only when V1 shows a persistent unexplained **Anomaly** and you need to rule out orphan-row noise (rows belonging to a removed `DataAreaId`). |
+| **v3** ⭐ **default** (bulk / fastest) | `getTableRowCounts` (once, all tables) + `getTableMetadata` (per table) | Catalog-based `sys.dm_db_partition_stats` counts, aggregated server-side into one JSON object | **Preferred** — collapses the per-table `COUNT_BIG(*)` scan and its HTTP round trip into a single bulk call, so it's the fastest option and scales best with many tables. Counts are catalog-based (like `COUNT_MODE=fast` on the Fabric side), so they're near-instant but can lag by a few seconds after a large bulk write until SQL Server's stats catch up. Falls back automatically to V2-style per-table metadata calls if the bulk call fails. |
+| **v1** | `getTableRecordCount`   | Direct SQL `COUNT(*)` against the AxDB | Fast per-table option, no X++ overhead. Use if you prefer exact per-table live counts over the catalog-based v3 estimate. |
+| **v2** (edge-case fallback) | `getTableRecordCountV2` | X++ `select count(RecId)` — same code path Fabric Link uses | Slower. Use only when v1/v3 show a persistent unexplained **Anomaly** and you need to rule out orphan-row noise (rows belonging to a removed `DataAreaId`). |
 
-Select the version with `D365_SERVICE_VERSION=v1` or `v2` in `.env` (default `v1`).
+Select the version with `D365_SERVICE_VERSION=v1`, `v2` or `v3` in `.env` (default `v3`).
 
 URL format:
 ```
 <D365_URI>/api/services/FabricHelperServiceGroup/FabricHelperService/getTableRecordCount
 <D365_URI>/api/services/FabricHelperServiceGroup/FabricHelperService/getTableRecordCountV2
+<D365_URI>/api/services/FabricHelperServiceGroup/FabricHelperService/getTableRowCounts
+<D365_URI>/api/services/FabricHelperServiceGroup/FabricHelperService/getTableMetadata
 ```
 Body:
 ```json
 { "_request": { "TableName": "<NAME>", "RequestId": "<id>" } }
 ```
 > `FabricLastSysRowVersion` (optional `int64`) can be added to the request body when the Fabric table has no `MODIFIEDDATETIME` column. D365 uses it to resolve the modification time of the record last synced to Fabric.
+
+`getTableRowCounts` takes a comma-separated `TableNames` string instead of a single `TableName` (or omit it to count every table registered in `AIFSQLROWVERSIONCHANGETRACKINGENABLEDTABLES`), and returns a single `RowCountsJson` field, e.g. `{"custtable": 89012, "batchhistory": 1234567}`. Requires Azure SQL Database (`JSON_OBJECTAGG` is not available on-prem).
 
 ## Table name mapping
 The D365 service expects F&O table names (e.g. `CUSTTABLE`). By default the script
@@ -85,6 +90,7 @@ Key environment variables (set in `.env`):
 | `AUTH_MODE` / `SYNAPSE_AUTH_MODE` | all | `interactive` (default), `cli`, or `serviceprincipal` |
 | `D365_URI` | D365 comparison | Base URL of the D365 F&O environment |
 | `COUNT_MODE` | Fabric only | `exact` (default) or `fast` — Synapse always uses `exact` |
+| `SAME_CREDENTIALS` | interactive auth | `true` (default) reuses one cached sign-in for Fabric/Synapse and D365; `false` forces a separate interactive sign-in for D365, so a different account can be used |
 
 ## Run
 ```powershell
@@ -113,6 +119,10 @@ Override the base names with `HTML_REPORT` and `CSV_REPORT` in `.env`. Leave eit
 
 ## Notes
 - Leave `FABRIC_TABLES` empty to count **every** user table in the database.
+- Set `SAME_CREDENTIALS=false` if the Fabric/Synapse endpoint and the D365 environment require different signed-in accounts — D365 will then prompt for its own interactive sign-in instead of reusing the Fabric/Synapse one.
 - For unattended/CI use, switch `AUTH_MODE=serviceprincipal` and grant the SP access to the workspace.
 - For Lakehouse data, point at the Lakehouse's **SQL analytics endpoint** (read-only) — same code path.- For **Synapse Link**, set `SOURCE_TYPE=synapse` and provide `SYNAPSE_SQL_ENDPOINT` / `SYNAPSE_DATABASE`. The serverless endpoint format is `<workspace>-ondemand.sql.azuresynapse.net`. Only `COUNT_BIG(*)` (exact mode) is supported — `sys.partitions` is not available on SQL Serverless.- For KQL databases or Power BI semantic models, this code won't apply — let me know and I'll add a variant.
+
+## Security
+- Interactive auth (`InteractiveBrowserCredential`) is cached **per process, in memory only** — never written to disk — so one run needs at most one browser sign-in instead of a new popup per token request.
 

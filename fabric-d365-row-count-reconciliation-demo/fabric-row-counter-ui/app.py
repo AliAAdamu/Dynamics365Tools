@@ -115,15 +115,27 @@ with st.sidebar.expander("Dynamics 365 F&O", expanded=True):
     skip_d365 = st.checkbox("Skip D365 (Fabric only)", value=False)
     d365_uri = st.text_input("D365 base URI", value=os.getenv("D365_URI", ""), disabled=skip_d365)
     d365_auth = st.selectbox("Auth mode", ["interactive", "serviceprincipal"], index=0, disabled=skip_d365)
+    same_credentials = st.checkbox(
+        "Use same sign-in for Fabric/Synapse and D365",
+        value=os.getenv("SAME_CREDENTIALS", "true").lower() in ("1", "true", "yes"),
+        disabled=skip_d365,
+        help=(
+            "Checked (default): one interactive sign-in is reused for both the Fabric/Synapse "
+            "SQL endpoint and D365 — only one browser popup. Uncheck if the Fabric/Synapse "
+            "endpoint and the D365 environment need different user accounts — a separate "
+            "sign-in prompt will appear for D365."
+        ),
+    )
     service_version = st.radio(
         "Service version",
-        ["v1", "v2"],
+        ["v3", "v1", "v2"],
         index=0,
         horizontal=True,
-        format_func=lambda v: {"v1": "v1 — Direct SQL (faster, default)",
-                                "v2": "v2 — X++ (edge-case fallback)"}[v],
+        format_func=lambda v: {"v1": "v1 — Direct SQL (per-table)",
+                                "v2": "v2 — X++ (edge-case fallback)",
+                                "v3": "v3 — Bulk catalog counts (fastest, default)"}[v],
         disabled=skip_d365,
-        help="v1 calls getTableRecordCount (default). v2 calls getTableRecordCountV2 — use only when v1 and Fabric counts disagree and you need to rule out orphan-row noise.",
+        help="v3 fetches counts for ALL tables in one bulk call (getTableRowCounts) and only queries per-table metadata — fastest, especially when reconciling many tables (default). v1 calls getTableRecordCount (direct SQL, per-table). v2 calls getTableRecordCountV2 — use only when counts disagree with Fabric and you need to rule out orphan-row noise.",
     )
 
 with st.sidebar.expander("Service principal (optional)", expanded=False):
@@ -189,6 +201,7 @@ def build_config(src: str = "fabric") -> cr.Config:
         html_open=False,
         csv_report=None,
         d365_service_version=service_version,
+        same_credentials=same_credentials,
     )
 
 
@@ -215,26 +228,47 @@ def run_comparison(cfg: cr.Config):
         return [
             (name, "-", n, None, "-", "N/A", sink, None, None, False, "N/A",
              fab_srv, fab_mod, False)
-            for name, n, sink, fab_srv, fab_mod in fabric_rows
+            for name, n, sink, fab_srv, fab_mod, f_err in fabric_rows
         ]
 
     progress.progress(0.4, text="Authenticating to D365…")
     token = cr.get_d365_token(cfg)
     session = requests.Session()
 
+    use_batch = cfg.d365_service_version == "v3"
+    batch_counts: dict[str, int] = {}
+    if use_batch:
+        status_box.write("Fetching row counts for all tables in one bulk call…")
+        d365_names = [cr.fabric_to_d365_name(name, cfg.table_name_map) for name, *_ in fabric_rows]
+        batch_counts, batch_err = cr.d365_count_batch(session, cfg.d365_uri, token, d365_names)
+        if batch_err:
+            st.warning(f"Bulk row count retrieval failed, falling back to per-table counts: {batch_err}")
+            use_batch = False
+
     rows = []
     total = len(fabric_rows)
-    for i, (fabric_name, fabric_count, sink, fabric_srv, fabric_mod) in enumerate(fabric_rows, 1):
+    for i, (fabric_name, fabric_count, sink, fabric_srv, fabric_mod, fabric_err) in enumerate(fabric_rows, 1):
         d365_name = cr.fabric_to_d365_name(fabric_name, cfg.table_name_map)
         status_box.write(f"Querying D365 for **{d365_name}** ({i}/{total})…")
-        d365_count_val, err, not_found, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est = cr.d365_count(
-            session, cfg.d365_uri, token, d365_name, cfg.d365_service_version,
-            fabric_srv=fabric_srv, fabric_mod=fabric_mod,
-        )
-        status, delta = cr.classify(fabric_count, d365_count_val, not_found, err)
+        if use_batch:
+            err, not_found, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est = cr.d365_metadata(
+                session, cfg.d365_uri, token, d365_name,
+                fabric_srv=fabric_srv, fabric_mod=fabric_mod,
+            )
+            key = d365_name.lower()
+            if not_found or key not in batch_counts:
+                d365_count_val, not_found = None, True
+            else:
+                d365_count_val = batch_counts[key]
+        else:
+            d365_count_val, err, not_found, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est = cr.d365_count(
+                session, cfg.d365_uri, token, d365_name, cfg.d365_service_version,
+                fabric_srv=fabric_srv, fabric_mod=fabric_mod,
+            )
+        status, delta = cr.classify(fabric_count, d365_count_val, not_found, err, fabric_err)
         fabric_last_mod = fabric_mod or fabric_synced_mod
         is_fabric_mod_est = fabric_mod is None and fabric_synced_mod is not None
-        latency = cr.compute_latency(last_mod, fabric_mod, fabric_synced_mod, sink)
+        latency = cr.compute_latency(last_mod, fabric_mod, fabric_synced_mod, sink, status)
         rows.append((fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink,
                      last_srv, last_mod, is_est, latency, fabric_srv, fabric_last_mod, is_fabric_mod_est))
         progress.progress(0.4 + 0.6 * i / total, text=f"D365 lookup {i}/{total}")
@@ -306,18 +340,28 @@ def render_results(rows, source_label: str = "Fabric"):
         "Running Latency", "Delta", "Status", "Last SinkModifiedOn",
     ]
     view = base[display_cols].copy()
-    # Pre-format numeric columns as strings to avoid "None" display in newer Streamlit/pandas.
-    def _fi(v, comma=False) -> str:
+    # Keep numeric columns as nullable ints (not strings) so clicking a column
+    # header sorts numerically instead of lexicographically. Comma formatting
+    # is applied via column_config (NumberColumn), not by pre-stringifying.
+    def _to_int(v):
         if v is None or (isinstance(v, float) and pd.isna(v)):
-            return "—"
-        return f"{int(v):,}" if comma else str(int(v))
-    view[f"{src} Rows"]       = view[f"{src} Rows"].apply(lambda v: _fi(v, comma=True))
-    view[f"{src} RowVersion"] = view[f"{src} RowVersion"].apply(_fi)
-    view["D365 Rows"]         = view["D365 Rows"].apply(lambda v: _fi(v, comma=True))
-    view["D365 RowVersion"]   = view["D365 RowVersion"].apply(_fi)
+            return pd.NA
+        return int(v)
+    for col in (f"{src} Rows", f"{src} RowVersion", "D365 Rows", "D365 RowVersion"):
+        view[col] = view[col].apply(_to_int).astype("Int64")
 
     styled = view.style.map(style_status, subset=["Status"])
-    st.dataframe(styled, use_container_width=True, height=560)
+    st.dataframe(
+        styled,
+        width="stretch",
+        height=560,
+        column_config={
+            f"{src} Rows": st.column_config.NumberColumn(format="%,d"),
+            f"{src} RowVersion": st.column_config.NumberColumn(format="%d"),
+            "D365 Rows": st.column_config.NumberColumn(format="%,d"),
+            "D365 RowVersion": st.column_config.NumberColumn(format="%d"),
+        },
+    )
 
     # Downloads
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -355,9 +399,12 @@ def render_results(rows, source_label: str = "Fabric"):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+if "results" not in st.session_state:
+    st.session_state["results"] = None
+
 left, right = st.columns([3, 1])
 with right:
-    run = st.button("▶️ Run comparison", type="primary", use_container_width=True)
+    run = st.button("▶️ Run comparison", type="primary", width="stretch")
 
 if run:
     try:
@@ -368,8 +415,10 @@ if run:
             cfg = build_config("fabric")
             t0 = time.time()
             rows = run_comparison(cfg)
-            st.success(f"Completed in {time.time() - t0:.1f}s — {len(rows)} table(s).")
-            render_results(rows, "Fabric")
+            st.session_state["results"] = {
+                "mode": "single", "label": "Fabric", "rows": rows,
+                "elapsed": time.time() - t0,
+            }
 
         elif _src == "synapse_link":
             if not synapse_endpoint or not synapse_database:
@@ -378,8 +427,10 @@ if run:
             cfg = build_config("synapse")
             t0 = time.time()
             rows = run_comparison(cfg)
-            st.success(f"Completed in {time.time() - t0:.1f}s — {len(rows)} table(s).")
-            render_results(rows, "Synapse")
+            st.session_state["results"] = {
+                "mode": "single", "label": "Synapse", "rows": rows,
+                "elapsed": time.time() - t0,
+            }
 
         else:  # both
             errors = []
@@ -391,23 +442,39 @@ if run:
                 for msg in errors:
                     st.error(msg)
                 st.stop()
-            tab_fab, tab_syn = st.tabs(["Fabric Link", "Synapse Link"])
             t0 = time.time()
-            with tab_fab:
-                st.subheader("Fabric Link ↔ Dynamics 365")
-                cfg_fab = build_config("fabric")
-                rows_fab = run_comparison(cfg_fab)
-                st.success(f"{len(rows_fab)} table(s) queried.")
-                render_results(rows_fab, "Fabric")
-            with tab_syn:
-                st.subheader("Synapse Link ↔ Dynamics 365")
-                cfg_syn = build_config("synapse")
-                rows_syn = run_comparison(cfg_syn)
-                st.success(f"{len(rows_syn)} table(s) queried.")
-                render_results(rows_syn, "Synapse")
-            st.caption(f"Both comparisons completed in {time.time() - t0:.1f}s.")
+            cfg_fab = build_config("fabric")
+            rows_fab = run_comparison(cfg_fab)
+            cfg_syn = build_config("synapse")
+            rows_syn = run_comparison(cfg_syn)
+            st.session_state["results"] = {
+                "mode": "both", "rows_fab": rows_fab, "rows_syn": rows_syn,
+                "elapsed": time.time() - t0,
+            }
 
     except Exception as e:
+        st.session_state["results"] = None
         st.exception(e)
-else:
+
+# Render from session_state rather than only inside `if run:` — Streamlit
+# reruns the whole script on every widget interaction (e.g. the results
+# filter or a download button), and `run` is only True on the exact rerun
+# where the button was clicked. Without this, any later widget interaction
+# would skip the `if run:` block and wipe the just-computed results.
+results = st.session_state.get("results")
+if results is None:
     st.info("Fill in the connection settings in the sidebar and click **Run comparison**.")
+elif results["mode"] == "single":
+    st.success(f"Completed in {results['elapsed']:.1f}s — {len(results['rows'])} table(s).")
+    render_results(results["rows"], results["label"])
+else:
+    tab_fab, tab_syn = st.tabs(["Fabric Link", "Synapse Link"])
+    with tab_fab:
+        st.subheader("Fabric Link ↔ Dynamics 365")
+        st.success(f"{len(results['rows_fab'])} table(s) queried.")
+        render_results(results["rows_fab"], "Fabric")
+    with tab_syn:
+        st.subheader("Synapse Link ↔ Dynamics 365")
+        st.success(f"{len(results['rows_syn'])} table(s) queried.")
+        render_results(results["rows_syn"], "Synapse")
+    st.caption(f"Both comparisons completed in {results['elapsed']:.1f}s.")

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import csv
 import html
+import json
 import os
 import re
 import struct
@@ -40,7 +41,24 @@ from dotenv import load_dotenv
 
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 FABRIC_SCOPE = "https://database.windows.net/.default"
-APP_VERSION = "1.1.0.2"
+APP_VERSION = "1.1.1.2"
+
+# Cache a single InteractiveBrowserCredential per process so MSAL's token cache
+# can serve subsequent get_token() calls silently. Creating a brand-new
+# InteractiveBrowserCredential() on every call spawns a new local redirect
+# listener + browser tab each time; if a stale tab from a previous attempt is
+# still open (or the OS reuses a just-freed port), its callback can land on the
+# new listener and fail OAuth 'state' (CSRF) validation with a confusing
+# "state mismatch" error instead of ever reaching the SQL/D365 connection.
+_interactive_credential_cache: dict[str, InteractiveBrowserCredential] = {}
+
+
+def _get_interactive_credential(key: str = "default") -> InteractiveBrowserCredential:
+    cred = _interactive_credential_cache.get(key)
+    if cred is None:
+        cred = InteractiveBrowserCredential()
+        _interactive_credential_cache[key] = cred
+    return cred
 
 
 @dataclass
@@ -75,6 +93,11 @@ class Config:
     html_open: bool
     csv_report: str | None
     d365_service_version: str
+    # When True (default), interactive auth reuses the same cached credential
+    # (and therefore the same signed-in account) for Fabric/Synapse and D365.
+    # When False, D365 gets its own InteractiveBrowserCredential instance so a
+    # different user can sign in for D365 than for Fabric/Synapse.
+    same_credentials: bool = True
 
 
 def _parse_map(raw: str) -> dict[str, str]:
@@ -117,7 +140,7 @@ def _parse_d365_datetime(raw) -> str | None:
         return None
 
 
-def compute_latency(d365_mod: str | None, fabric_mod: str | None, fabric_synced_mod: str | None = None, sink_mod: str | None = None) -> str:
+def compute_latency(d365_mod: str | None, fabric_mod: str | None, fabric_synced_mod: str | None = None, sink_mod: str | None = None, status: str | None = None) -> str:
     """Return a human-readable lag between D365’s latest change and Fabric’s last known state.
 
     Reference priority for the Fabric side:
@@ -126,7 +149,13 @@ def compute_latency(d365_mod: str | None, fabric_mod: str | None, fabric_synced_
        SinkModifiedOn is a more recent ingestion marker in that case.
     3. Falls back to fabric_synced_mod (estimated from D365 SYSROWVERSION).
     ‘0s’ = Fabric current or ahead.  ‘N/A’ = timestamps unavailable.
+
+    When ``status`` is ``"Match"`` the row counts are already aligned between the
+    source and D365, so a latency figure wouldn't be meaningful — skip the
+    calculation entirely and return "N/A".
     """
+    if status == "Match":
+        return "N/A"
     ref = fabric_mod or fabric_synced_mod
     # Override with SinkModifiedOn when it is a better “how current is Fabric” proxy:
     # i.e. more recent than MODIFIEDDATETIME but still behind D365’s latest change.
@@ -195,7 +224,8 @@ def load_config() -> Config:
         html_report=(os.getenv("HTML_REPORT") or "").strip() or None,
         html_open=os.getenv("HTML_OPEN", "true").lower() in ("1", "true", "yes"),
         csv_report=(os.getenv("CSV_REPORT") or "").strip() or None,
-        d365_service_version=os.getenv("D365_SERVICE_VERSION", "v1").strip().lower(),
+        d365_service_version=os.getenv("D365_SERVICE_VERSION", "v3").strip().lower(),
+        same_credentials=os.getenv("SAME_CREDENTIALS", "true").lower() in ("1", "true", "yes"),
     )
 
 
@@ -211,7 +241,7 @@ def get_fabric_token(cfg: Config) -> str:
     elif cfg.auth_mode == "cli":
         cred = AzureCliCredential()
     else:
-        cred = InteractiveBrowserCredential()
+        cred = _get_interactive_credential("default" if cfg.same_credentials else "source")
     return cred.get_token(FABRIC_SCOPE).token
 
 
@@ -252,7 +282,7 @@ def get_synapse_token(cfg: Config) -> str:
     elif cfg.synapse_auth_mode == "cli":
         cred = AzureCliCredential()
     else:
-        cred = InteractiveBrowserCredential()
+        cred = _get_interactive_credential("default" if cfg.same_credentials else "source")
     return cred.get_token(FABRIC_SCOPE).token  # https://database.windows.net/.default
 
 
@@ -290,12 +320,50 @@ def split_table(name: str) -> tuple[str, str]:
     return "dbo", name.strip("[] ")
 
 
-def count_fabric_fast(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[str, int, str | None, int | None, str | None]]:
+def _resolve_table_case(conn: pyodbc.Connection, tables: list[str]) -> tuple[list[str], set[str]]:
+    """Resolve user-supplied schema.table names to their actual stored case.
+
+    Fabric Warehouse (and some Synapse SQL Serverless databases) default to a
+    case-sensitive (BIN2) collation, so ``FROM [dbo].[BatchHistory]`` raises
+    "Invalid object name" if the real object is ``dbo.batchhistory``. Look up
+    the real casing once via INFORMATION_SCHEMA and substitute it so manually
+    typed table names (any case) still resolve.
+
+    Returns (resolved_names, not_found_set). Names with no catalog match are
+    passed through unchanged AND included in ``not_found_set`` — callers should
+    treat those as "table doesn't exist on this side" (e.g. a system table like
+    BatchHistory that was never part of the Fabric/Synapse Link sync scope)
+    rather than attempting a doomed query and reporting a generic Error.
+    """
+    if not tables:
+        return tables, set()
+    cur = conn.cursor()
+    cur.execute("SELECT table_schema, table_name FROM INFORMATION_SCHEMA.TABLES")
+    catalog = {f"{s.upper()}.{t.upper()}": f"{s}.{t}" for s, t in cur.fetchall()}
+    resolved = []
+    not_found: set[str] = set()
+    for name in tables:
+        schema, tbl = split_table(name)
+        key = f"{schema.upper()}.{tbl.upper()}"
+        full = f"{schema}.{tbl}"
+        resolved_name = catalog.get(key, full)
+        resolved.append(resolved_name)
+        if key not in catalog:
+            not_found.add(resolved_name)
+    return resolved, not_found
+
+
+def count_fabric_fast(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[str, int | None, str | None, int | None, str | None, str | None]]:
     cur = conn.cursor()
     if tables:
-        results: list[tuple[str, int, str | None, int | None, str | None]] = []
+        tables, not_found = _resolve_table_case(conn, tables)
+        results: list[tuple[str, int | None, str | None, int | None, str | None, str | None]] = []
         for t in tables:
             schema, tbl = split_table(t)
+            full = f"{schema}.{tbl}"
+            if full in not_found:
+                results.append((full, None, None, None, None, "NOT_FOUND"))
+                continue
             cur.execute(
                 """
                 SELECT ISNULL(SUM(p.rows), 0)
@@ -307,7 +375,7 @@ def count_fabric_fast(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[
                 schema, tbl,
             )
             row = cur.fetchone()
-            results.append((f"{schema}.{tbl}", int(row[0]) if row else 0, None, None, None))
+            results.append((full, int(row[0]) if row else 0, None, None, None, None))
         return results
 
     cur.execute(
@@ -320,28 +388,38 @@ def count_fabric_fast(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[
         ORDER BY s.name, t.name
         """
     )
-    return [(r[0], int(r[1]) if r[1] is not None else 0, None, None, None) for r in cur.fetchall()]
+    return [(r[0], int(r[1]) if r[1] is not None else 0, None, None, None, None) for r in cur.fetchall()]
 
 
-def count_fabric_exact(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[str, int, str | None, int | None, str | None]]:
+def count_fabric_exact(conn: pyodbc.Connection, tables: list[str]) -> list[tuple[str, int | None, str | None, int | None, str | None, str | None]]:
     cur      = conn.cursor()  # main cursor for SELECT COUNT / aggregate queries
     cur_meta = conn.cursor()  # separate cursor for INFORMATION_SCHEMA detection
+    not_found: set[str] = set()
     if not tables:
         cur_meta.execute(
             "SELECT table_schema + '.' + table_name FROM INFORMATION_SCHEMA.TABLES "
             "WHERE table_type = 'BASE TABLE' ORDER BY 1"
         )
         tables = [r[0] for r in cur_meta.fetchall()]
+    else:
+        tables, not_found = _resolve_table_case(conn, tables)
 
     def _dt(v) -> str | None:
         if v is None:
             return None
         return v.strftime("%Y-%m-%d %H:%M:%S") if hasattr(v, "strftime") else (str(v) or None)
 
-    results: list[tuple[str, int, str | None, int | None, str | None]] = []
+    results: list[tuple[str, int | None, str | None, int | None, str | None, str | None]] = []
     for t in tables:
         schema, tbl = split_table(t)
         full = f"{schema}.{tbl}"
+        if full in not_found:
+            # Table doesn't exist in this Fabric/Synapse database at all (e.g. a
+            # system table like BatchHistory that was never in the Link sync scope).
+            # Report it as missing rather than running a doomed query and showing
+            # a generic, undiagnosable "Error".
+            results.append((full, None, None, None, None, "NOT_FOUND"))
+            continue
         # Detect available columns via a targeted INFORMATION_SCHEMA.COLUMNS query
         # using a DEDICATED cursor so it doesn't interfere with the main SELECT cursor.
         t_col_map: dict[str, str] = {}
@@ -385,14 +463,16 @@ def count_fabric_exact(conn: pyodbc.Connection, tables: list[str]) -> list[tuple
                 _dt(row[1]),
                 fabric_srv,
                 _dt(row[3]),
+                None,
             ))
         except Exception as _count_err:
             # Table metadata exists but underlying storage is unavailable
             # (e.g. OneLake Parquet file missing, Fabric Link sync in progress).
-            # Record None so this table shows as Error without aborting the run.
+            # Record the real error message so this shows up as an actionable
+            # Error (not a blank one) instead of silently aborting the run.
             import sys as _sys
             print(f"[WARN] Count query failed for {full}: {_count_err}", file=_sys.stderr, flush=True)
-            results.append((full, None, None, None, None))
+            results.append((full, None, None, None, None, str(_count_err)))
     return results
 
 
@@ -403,13 +483,19 @@ def count_fabric_exact(conn: pyodbc.Connection, tables: list[str]) -> list[tuple
 def get_d365_token(cfg: Config) -> str:
     if not cfg.d365_uri:
         raise SystemExit("D365_URI is required to call the FabricHelperService.")
+    if not cfg.d365_uri.startswith(("http://", "https://")):
+        raise SystemExit(
+            f"D365 base URI '{cfg.d365_uri}' is not a valid URL — it must start with https:// "
+            "(e.g. https://yourorg.operations.dynamics.com). This looks like it might be a "
+            "Fabric/Dataverse mirrored-database name, not the D365 F&O environment URL."
+        )
     scope = f"{cfg.d365_uri}/.default"
     if cfg.d365_auth_mode == "serviceprincipal":
         if not (cfg.d365_tenant_id and cfg.d365_client_id and cfg.d365_client_secret):
             raise SystemExit("D365 service principal auth requires D365_TENANT_ID, D365_CLIENT_ID, D365_CLIENT_SECRET.")
         cred = ClientSecretCredential(cfg.d365_tenant_id, cfg.d365_client_id, cfg.d365_client_secret)
     else:
-        cred = InteractiveBrowserCredential()
+        cred = _get_interactive_credential("default" if cfg.same_credentials else "d365")
     return cred.get_token(scope).token
 
 
@@ -429,6 +515,8 @@ def d365_count(session: requests.Session, base_uri: str, token: str, table_name:
     service_version:
       - "v1": getTableRecordCount   (direct SQL query - faster)
       - "v2": getTableRecordCountV2 (X++ query - identical to Fabric Link)
+      - "v3": use d365_count_batch() + d365_metadata() instead (bulk catalog-based
+              counts in one round trip); this function is not used in that mode.
     fabric_mod: MAX(MODIFIEDDATETIME) from Fabric — when provided, D365 is not asked for a sync point.
     fabric_srv: MAX(SYSROWVERSION) from Fabric — sent to D365 only when fabric_mod is None.
     """
@@ -489,16 +577,117 @@ def d365_count(session: requests.Session, base_uri: str, token: str, table_name:
     return None, msg or "service returned Success=false", False, None, None, False, None, False
 
 
+def _post_d365(session: requests.Session, url: str, token: str, body: dict) -> tuple[requests.Response | None, str | None]:
+    """POST to a FabricHelperService operation with 429/5xx retry. Returns (response, error)."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    r = None
+    for attempt in range(5):
+        try:
+            r = session.post(url, json=body, headers=headers, timeout=120)
+        except requests.RequestException as e:
+            return None, f"network: {e}"
+        if r.status_code in (429, 502, 503, 504):
+            wait = int(r.headers.get("Retry-After", "0")) or (2 ** attempt)
+            time.sleep(min(wait, 30))
+            continue
+        break
+    return r, None
+
+
+def d365_count_batch(session: requests.Session, base_uri: str, token: str, table_names: list[str]) -> tuple[dict[str, int], str | None]:
+    """Calls getTableRowCounts ONCE for every table in table_names.
+
+    Returns (counts_by_lower_table_name, error). A table missing from the
+    returned dict means D365 has no such table (or it wasn't counted) —
+    callers should treat that the same way as a per-table 404 (not_found).
+
+    Uses catalog-based statistics (sys.dm_db_partition_stats) server-side, so
+    it avoids a COUNT_BIG(*) scan per table and collapses N HTTP round trips
+    into one.
+    """
+    if not table_names:
+        return {}, None
+    url = f"{base_uri}/api/services/FabricHelperServiceGroup/FabricHelperService/getTableRowCounts"
+    body = {"_request": {"TableNames": ",".join(table_names), "RequestId": f"FRC-{uuid.uuid4().hex[:8]}"}}
+    r, err = _post_d365(session, url, token, body)
+    if err:
+        return {}, err
+    if r.status_code != 200:
+        return {}, f"HTTP {r.status_code}: {r.text[:200]}"
+    try:
+        data = r.json()
+    except ValueError:
+        return {}, f"non-JSON response: {r.text[:200]}"
+    if not data.get("Success", False):
+        return {}, data.get("Message") or "service returned Success=false"
+    try:
+        counts = json.loads(data.get("RowCountsJson") or "{}")
+    except ValueError:
+        return {}, "invalid RowCountsJson in response"
+    return {str(k).lower(): int(v) for k, v in counts.items()}, None
+
+
+def d365_metadata(session: requests.Session, base_uri: str, token: str, table_name: str, *, fabric_srv: int | None = None, fabric_mod: str | None = None) -> tuple[str | None, bool, int | None, str | None, bool, str | None, bool]:
+    """Calls getTableMetadata for a single table — same metadata as d365_count()
+    but WITHOUT computing a row count (no COUNT_BIG(*) scan). Pair with
+    d365_count_batch() for the counts.
+
+    Returns (error, not_found, last_sysrowversion, last_modified_dt, is_estimated, fabric_synced_mod, is_fabric_sync_est).
+    """
+    url = f"{base_uri}/api/services/FabricHelperServiceGroup/FabricHelperService/getTableMetadata"
+    body = {"_request": {"TableName": table_name, "RequestId": f"FRC-{uuid.uuid4().hex[:8]}"}}
+    if fabric_mod is None and fabric_srv:
+        body["_request"]["FabricLastSysRowVersion"] = fabric_srv
+
+    r, err = _post_d365(session, url, token, body)
+    if err:
+        return err, False, None, None, False, None, False
+    if r.status_code == 404:
+        return None, True, None, None, False, None, False
+    if r.status_code != 200:
+        return f"HTTP {r.status_code}: {r.text[:200]}", False, None, None, False, None, False
+    try:
+        data = r.json()
+    except ValueError:
+        return f"non-JSON response: {r.text[:200]}", False, None, None, False, None, False
+
+    if data.get("Success", False):
+        last_srv = int(data.get("LastSysRowVersion") or 0)
+        last_mod = _parse_d365_datetime(data.get("LastModifiedDateTime"))
+        is_est = bool(data.get("IsEstimated", False))
+        fabric_synced_mod = _parse_d365_datetime(data.get("FabricSyncedModifiedDateTime"))
+        is_fabric_sync_est = bool(data.get("IsFabricSyncEstimated", False))
+        return None, False, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est
+
+    msg = (data.get("Message") or "").strip()
+    echoed_table = data.get("TableName") or ""
+    not_found_markers = ("does not exist", "not found", "unknown table", "no such table", "invalid table")
+    looks_generic = msg.lower().rstrip(":").strip() in ("error", "") and not echoed_table
+    if looks_generic or any(m in msg.lower() for m in not_found_markers):
+        return None, True, None, None, False, None, False
+    return msg or "service returned Success=false", False, None, None, False, None, False
+
+
 # ---------------------------------------------------------------------------
 # Comparison & reporting
 # ---------------------------------------------------------------------------
 
-def classify(fabric: int | None, d365: int | None, not_found: bool, err: str | None) -> tuple[str, str]:
+def classify(fabric: int | None, d365: int | None, not_found: bool, err: str | None, fabric_err: str | None = None) -> tuple[str, str]:
     """Return (status, delta_str)."""
     if not_found:
         return "N/A", "-"
     if err:
         return "Error", err[:60]
+    if fabric_err == "NOT_FOUND":
+        # Table simply doesn't exist on the Fabric/Synapse side (e.g. an
+        # unsynced system table) — this is an expected gap, not an app error.
+        return "N/A", "-"
+    if fabric_err:
+        return "Error", f"Fabric: {fabric_err[:50]}"
     if fabric is None or d365 is None:
         return "Error", "-"
     delta = d365 - fabric
@@ -535,6 +724,7 @@ def render_html_report(cfg: Config, rows, counts, out_path: str, source_label: s
         if is_fabric_mod_est and fabric_last_mod:
             fab_mod_content += ' <em title="Estimated from correlated changes via SYSROWVERSION" style="color:#888;font-size:11px">(est.)</em>'
         d365_disp    = f"{d365_count_val:,}" if d365_count_val is not None else "—"
+        fabric_disp  = f"{fabric_count:,}" if fabric_count is not None else "Error"
         srv_disp     = "—" if last_srv is None else str(last_srv)
         mod_content  = html.escape(last_mod) if last_mod else "—"
         if is_est and last_mod:
@@ -544,7 +734,7 @@ def render_html_report(cfg: Config, rows, counts, out_path: str, source_label: s
             "<tr>"
             + cell(fabric_name)
             + cell(d365_name)
-            + cell(f"{fabric_count:,}", "right")
+            + cell(fabric_disp, "right")
             + cell(fab_srv_disp, "right")
             + f'<td style="text-align:center;white-space:nowrap">{fab_mod_content}</td>'
             + cell(d365_disp, "right")
@@ -681,8 +871,8 @@ def main() -> int:
         width = max((len(name) for name, *_ in fabric_rows), default=10)
         print(f"\n{'Table'.ljust(width)}  {f'{source_label} Rows':>15}  {'Last SinkModifiedOn':>20}")
         print(f"{'-' * width}  {'-' * 15}  {'-' * 20}")
-        for name, n, sink, *_ in fabric_rows:
-            n_disp = f"{n:,}" if n is not None else "Error"
+        for name, n, sink, _srv, _mod, f_err in fabric_rows:
+            n_disp = "N/A (not found)" if f_err == "NOT_FOUND" else (f"{n:,}" if n is not None else "Error")
             print(f"{name.ljust(width)}  {n_disp:>15}  {(sink or '-'):>20}")
         print(f"\n{len(fabric_rows)} table(s) reported.")
         return 0
@@ -691,17 +881,39 @@ def main() -> int:
     d365_token = get_d365_token(cfg)
     session = requests.Session()
 
+    use_batch = cfg.d365_service_version == "v3"
+    batch_counts: dict[str, int] = {}
+    if use_batch:
+        d365_names = [fabric_to_d365_name(fabric_name, cfg.table_name_map) for fabric_name, *_ in fabric_rows]
+        batch_counts, batch_err = d365_count_batch(session, cfg.d365_uri, d365_token, d365_names)
+        if batch_err:
+            print(f"[WARN] Bulk row count retrieval failed, falling back to per-table counts: {batch_err}", file=sys.stderr, flush=True)
+            use_batch = False
+
     rows: list[tuple] = []
-    for fabric_name, fabric_count, sink, fabric_srv, fabric_mod in fabric_rows:
+    for fabric_name, fabric_count, sink, fabric_srv, fabric_mod, fabric_err in fabric_rows:
         d365_name = fabric_to_d365_name(fabric_name, cfg.table_name_map)
-        d365_count_val, err, not_found, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est = d365_count(
-            session, cfg.d365_uri, d365_token, d365_name, cfg.d365_service_version,
-            fabric_srv=fabric_srv, fabric_mod=fabric_mod,
-        )
-        status, delta = classify(fabric_count, d365_count_val, not_found, err)
+        if use_batch:
+            # Counts came from the single bulk getTableRowCounts call (catalog-based,
+            # no per-table scan); only metadata (rowversion/modified) is fetched here.
+            err, not_found, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est = d365_metadata(
+                session, cfg.d365_uri, d365_token, d365_name,
+                fabric_srv=fabric_srv, fabric_mod=fabric_mod,
+            )
+            key = d365_name.lower()
+            if not_found or key not in batch_counts:
+                d365_count_val, not_found = None, True
+            else:
+                d365_count_val = batch_counts[key]
+        else:
+            d365_count_val, err, not_found, last_srv, last_mod, is_est, fabric_synced_mod, is_fabric_sync_est = d365_count(
+                session, cfg.d365_uri, d365_token, d365_name, cfg.d365_service_version,
+                fabric_srv=fabric_srv, fabric_mod=fabric_mod,
+            )
+        status, delta = classify(fabric_count, d365_count_val, not_found, err, fabric_err)
         fabric_last_mod = fabric_mod or fabric_synced_mod
         is_fabric_mod_est = fabric_mod is None and fabric_synced_mod is not None
-        latency = compute_latency(last_mod, fabric_mod, fabric_synced_mod, sink)
+        latency = compute_latency(last_mod, fabric_mod, fabric_synced_mod, sink, status)
         rows.append((fabric_name, d365_name, fabric_count, d365_count_val, delta, status, sink,
                      last_srv, last_mod, is_est, latency, fabric_srv, fabric_last_mod, is_fabric_mod_est))
 
