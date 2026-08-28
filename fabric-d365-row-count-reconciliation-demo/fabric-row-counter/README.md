@@ -21,9 +21,10 @@ Small Python CLI that connects to a Microsoft Fabric **Warehouse**, **Lakehouse 
   - **D365 Last Modified** — `MAX(MODIFIEDDATETIME)` from D365 when the column is enabled. If not, an estimate is provided and flagged with `(est.)`.
   - **Running Latency** — `D365 Last Modified − Source Last Modified` (or `D365 Last Modified − SinkModifiedOn` when `SinkModifiedOn` is more recent than `MODIFIEDDATETIME` but still behind D365). Rendered as `3d 4h`, `45m 12s`, `0s` (current or ahead), or `N/A` when timestamps are unavailable. **This value is most meaningful when Status is Drift or Anomaly** — it shows how far the mirror lags behind the source. For Match rows the mirror is fully in sync so a non-zero value simply reflects normal replication delay that hasn’t yet produced a row-count gap.
 - Generates a timestamped **HTML report** (sortable / filterable grid) and a matching **CSV** on every run.
-- Two counting modes (controlled by `COUNT_MODE` in `.env`):
+- Two **analytical-source** counting modes (controlled by `COUNT_MODE` in `.env`):
   - **exact** (default) — runs `SELECT COUNT_BIG(*)` per table. Required for Fabric Warehouse and **mandatory** for Synapse SQL Serverless (`sys.partitions` is not available on serverless endpoints).
   - **fast** — reads `sys.partitions` metadata. Instant on classic SQL Server / Azure SQL DB, but returns 0 on Fabric Warehouse and **must not be used** with Synapse SQL Serverless.
+- Three **D365 counting models** (controlled by `D365_SERVICE_VERSION` in `.env`): **v3**, **v1**, and **v2**, as detailed below.
 
 ## D365 endpoint — V1 vs V2 vs V3
 The script POSTs to operations on the same `FabricHelperService`:
@@ -31,8 +32,8 @@ The script POSTs to operations on the same `FabricHelperService`:
 | Version | Operation(s) | Backend | When to use |
 | ------- | --------- | ------- | ----------- |
 | **v3** ⭐ **default** (bulk / fastest) | `getTableRowCounts` (once, all tables) + `getTableMetadata` (per table) | Catalog-based `sys.dm_db_partition_stats` counts, aggregated server-side into one JSON object | **Preferred** — collapses the per-table `COUNT_BIG(*)` scan and its HTTP round trip into a single bulk call, so it's the fastest option and scales best with many tables. Counts are catalog-based (like `COUNT_MODE=fast` on the Fabric side), so they're near-instant but can lag by a few seconds after a large bulk write until SQL Server's stats catch up. Falls back automatically to V2-style per-table metadata calls if the bulk call fails. |
-| **v1** | `getTableRecordCount`   | Direct SQL `COUNT(*)` against the AxDB | Fast per-table option, no X++ overhead. Use if you prefer exact per-table live counts over the catalog-based v3 estimate. |
-| **v2** (edge-case fallback) | `getTableRecordCountV2` | X++ `select count(RecId)` — same code path Fabric Link uses | Slower. Use only when v1/v3 show a persistent unexplained **Anomaly** and you need to rule out orphan-row noise (rows belonging to a removed `DataAreaId`). |
+| **v1** | `getTableRecordCount`   | Direct SQL `COUNT(*)` against the AxDB | Fast per-table option, no X++ overhead. Use if you prefer exact per-table live counts over the catalog-based v3 estimate. **Because it scans and counts each table, it can time out or fail on very large tables—the same limitation applies to v2.** |
+| **v2** (edge-case fallback) | `getTableRecordCountV2` | X++ `select count(RecId)` — same code path Fabric Link uses | Slower. Use only when v1/v3 show a persistent unexplained **Anomaly** and you need to rule out orphan-row noise (rows belonging to a removed `DataAreaId`). **Like v1, it can time out or fail on very large tables.** |
 
 Select the version with `D365_SERVICE_VERSION=v1`, `v2` or `v3` in `.env` (default `v3`).
 
